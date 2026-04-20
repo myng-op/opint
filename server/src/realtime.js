@@ -20,6 +20,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { config } from './config.js';
 import { Interview } from './models/Interview.js';
 import { QuestionSet } from './models/QuestionSet.js';
+import { TranscriptTurn } from './models/TranscriptTurn.js';
 import { buildSessionConfig } from './realtime/session.js';
 import { handleToolCall } from './realtime/tools.js';
 import { describeEvent } from './logging.js';
@@ -77,6 +78,27 @@ export function attachRealtimeProxy(httpServer) {
     }
     console.log(`[rt ${cid}] questionSet loaded title="${questionSet.title}" questions=${questionSet.questions.length}`);
 
+    // Seed the per-interview transcript sequence counter. Using countDocuments
+    // means reconnects to the same Interview keep monotonic numbering instead
+    // of restarting at 0.
+    let turnSequence = await TranscriptTurn.countDocuments({ interviewId }).catch(() => 0);
+    console.log(`[rt ${cid}] transcript sequence seeded at ${turnSequence}`);
+
+    async function persistTurn(role, text) {
+      try {
+        const doc = await TranscriptTurn.create({
+          interviewId,
+          sequence: turnSequence,
+          role,
+          text: text ?? '',
+        });
+        console.log(`[rt ${cid}] transcript SAVE seq=${turnSequence} role=${role} len=${(text ?? '').length} id=${doc._id}`);
+        turnSequence++;
+      } catch (err) {
+        console.error(`[rt ${cid}] transcript SAVE FAILED role=${role} err=${err.message}`);
+      }
+    }
+
     // ---- Open upstream WS to Azure ----
     const upstreamUrl = buildUpstreamUrl();
     console.log(`[rt ${cid}] opening upstream ${upstreamUrl}`);
@@ -126,6 +148,14 @@ export function attachRealtimeProxy(httpServer) {
 
       // Forward every frame to the browser unchanged.
       if (client.readyState === WebSocket.OPEN) client.send(raw);
+
+      // --- Transcript capture (completed events only, no delta buffering) ---
+      if (msg?.type === 'conversation.item.input_audio_transcription.completed') {
+        await persistTurn('user', msg.transcript ?? '');
+      }
+      if (msg?.type === 'response.output_audio_transcript.done' || msg?.type === 'response.audio_transcript.done') {
+        await persistTurn('assistant', msg.transcript ?? '');
+      }
 
       // --- Tool call interception ---
       if (msg?.type === 'response.function_call_arguments.done') {

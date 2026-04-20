@@ -103,9 +103,32 @@ Lifecycle:
 - `in_progress` — set on the first `get_next_interview_question` call, stamps `startedAt`
 - `completed` — set when the tool runs out of questions OR `/end` is called; stamps `endedAt`
 
-### `TranscriptTurn` (planned, Phase 5)
+### `TranscriptTurn` (implemented, Phase 5)
 
-One user-or-assistant utterance tied to an `Interview`.
+One completed utterance tied to an `Interview`. We persist **only on
+completion** events — no delta buffering:
+
+- user turn    → `conversation.item.input_audio_transcription.completed`
+- assistant turn → `response.output_audio_transcript.done`
+  (or the legacy `response.audio_transcript.done`)
+
+If the WS dies mid-turn, that half-turn is dropped. This keeps the DB clean of
+noise and means a stored transcript reflects what was actually finalised by
+whisper (user) and the model (assistant).
+
+```
+TranscriptTurn {
+  _id: ObjectId
+  interviewId: ObjectId        // ref → Interview
+  sequence: number             // monotonic per interview; seeded from countDocuments at WS open
+  role: "user" | "assistant"
+  text: string
+  createdAt, updatedAt
+}
+```
+
+Indexes: `{ interviewId: 1, sequence: 1 }` so `/transcript` reads stream back
+in order without a separate sort pass.
 
 ## REST surface (current)
 
@@ -115,8 +138,10 @@ One user-or-assistant utterance tied to an `Interview`.
 | GET    | `/api/question-sets`          | List sets (title + count, no question bodies) |
 | GET    | `/api/question-sets/:id`      | One set with full ordered questions           |
 | POST   | `/api/interviews`             | Create Interview; body `{ questionSetId }`    |
+| GET    | `/api/interviews`             | List all interviews (id, title, status, turn count) |
 | POST   | `/api/interviews/:id/end`     | Mark Interview completed (idempotent)         |
 | GET    | `/api/interviews/:id`         | Read Interview state                          |
+| GET    | `/api/interviews/:id/transcript` | Ordered list of completed turns             |
 
 ## Realtime session lifecycle (Phase 3 + 4)
 
@@ -163,8 +188,8 @@ Key properties:
 ## Open questions / decisions deferred
 
 - **Auth** — none in the demo. Revisit if the interviewee surface is ever exposed to untrusted users.
-- **Transcript storage format** — raw events vs. cleaned turns. Leaning toward
-  cleaned turns + an optional raw event log for debugging.
+- **Transcript storage format** — landed on cleaned turns in `TranscriptTurn`
+  (Phase 5). JSON export / raw-event log can be added later if needed.
 - **Tool-call execution** — run inside `realtime.js` on the server, so the model
   never learns about our DB and the browser never sees question text it hasn't
   already received as audio/transcript.

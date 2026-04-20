@@ -23,6 +23,9 @@ export function describeEvent(raw, msg) {
   if (t === 'response.output_audio_transcript.delta' || t === 'response.audio_transcript.delta') {
     return `${t} "${(msg.delta ?? '').replace(/\n/g, ' ').slice(0, 80)}"`;
   }
+  if (t === 'response.output_audio_transcript.done' || t === 'response.audio_transcript.done') {
+    return `${t} transcript="${(msg.transcript ?? '').replace(/\n/g, ' ').slice(0, 120)}"`;
+  }
   if (t === 'conversation.item.input_audio_transcription.completed') {
     return `${t} transcript="${(msg.transcript ?? '').replace(/\n/g, ' ').slice(0, 120)}"`;
   }

@@ -104,8 +104,10 @@ See `ARCHITECTURE.md` for the full table. Quick reference:
 - `GET  /api/question-sets`            — list (title + count)
 - `GET  /api/question-sets/:id`        — full detail with ordered questions
 - `POST /api/interviews`               — body `{ questionSetId }`
+- `GET  /api/interviews`               — list all interviews (id, title, status, turn count)
 - `GET  /api/interviews/:id`           — read interview state
 - `POST /api/interviews/:id/end`       — mark completed (idempotent)
+- `GET  /api/interviews/:id/transcript` — ordered list of completed turns
 
 ## Logging
 
