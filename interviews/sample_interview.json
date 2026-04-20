@@ -1,0 +1,23 @@
+{
+  "q1": {
+    "content": "To start, could you tell me a bit about yourself and how technology has played a role in your life — either professionally or personally?",
+    "type": "qualitative",
+    "requirement": "Learn about the person's general background and their relationship with technology. Understand how central technology is to their daily life and work.",
+    "condition": "",
+    "max_sec": 180
+  },
+  "q2": {
+    "content": "Can you think of a specific moment when a piece of technology — a tool, a device, or an application — significantly changed the way you work or think about something?",
+    "type": "qualitative",
+    "requirement": "Understand a concrete turning point or memorable experience the person has had with technology. Get specific details about what changed and why it mattered to them.",
+    "condition": "",
+    "max_sec": 150
+  },
+  "q3": {
+    "content": "On the flip side, is there a time when technology frustrated or let you down in a meaningful way?",
+    "type": "qualitative",
+    "requirement": "Learn about a negative or frustrating experience with technology to get a balanced view of the person's relationship with it.",
+    "condition": "",
+    "max_sec": 120
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "opint",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "mongo:up": "docker compose up -d mongo",
+    "mongo:down": "docker compose down",
+    "mongo:logs": "docker compose logs -f mongo",
+    "kill-ports": "lsof -ti tcp:3001,5173 2>/dev/null | xargs kill -9 2>/dev/null; exit 0",
+    "server": "cd server && npm run dev",
+    "client": "cd client && npm run dev",
+    "seed": "cd server && npm run seed",
+    "predev": "npm run kill-ports",
+    "dev": "concurrently -n server,client -c cyan,magenta \"npm run server\" \"npm run client\"",
+    "install:all": "npm install && cd server && npm install && cd ../client && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
