@@ -35,7 +35,7 @@ updated as each phase lands.
 | `ws`               | Standard Node WS lib, works both as server and upstream client.     |
 | Mongoose           | Schema validation + model methods; makes the data model explicit.   |
 | Vite               | Fast dev server, native ESM, simple WS proxy config.                |
-| React Router       | Two surfaces (`/`, `/admin`) with zero framework beyond that.       |
+| React Router       | Single route today; a shell that can host more pages without a refactor. |
 | Docker Compose     | Disposable Mongo for dev; one command up/down, no host pollution.   |
 
 ## Audio pipeline
@@ -162,7 +162,7 @@ Key properties:
 
 ## Open questions / decisions deferred
 
-- **Auth** — none yet; Phase 8 will add something minimal for `/admin`.
+- **Auth** — none in the demo. Revisit if the interviewee surface is ever exposed to untrusted users.
 - **Transcript storage format** — raw events vs. cleaned turns. Leaning toward
   cleaned turns + an optional raw event log for debugging.
 - **Tool-call execution** — run inside `realtime.js` on the server, so the model
