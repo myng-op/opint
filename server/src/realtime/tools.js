@@ -44,7 +44,9 @@ async function getNextInterviewQuestion({ interviewId, questionSet }) {
     } else {
       console.log(`[tools] interview already completed id=${interviewId} — returning done again`);
     }
-    return { done: true };
+    return { done: true,
+             closing_note: 'Thank the participant warmly for sharing their story. Their contribution is valuable to this research.'
+     };
   }
 
   const q = questionSet.questions[idx];
@@ -63,7 +65,14 @@ async function getNextInterviewQuestion({ interviewId, questionSet }) {
   const result = {
     key: q.key,
     content: q.content,
+    // `type` tells the model how to deliver this item: `non-question` items
+    // (intro, transitions, closing) are *stated*, not asked, and the model
+    // should fetch the next item without waiting for a participant response.
+    // `qualitative` / `factual` are asked as questions and require waiting.
+    type: q.type,
     requirement: q.requirement,
+    // Snake_case on the wire — that's what the model sees. Null = unlimited.
+    max_sec: q.maxSec,
     question_number: idx + 1,
     total_questions: total,
   };

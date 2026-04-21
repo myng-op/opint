@@ -5,6 +5,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    // Allow importing assets from repo-root `../icons` (one level above client/).
+    // Without this, Vite's dev server blocks reads outside the project root.
+    fs: { allow: ['..'] },
     proxy: {
       // REST API — browser fetches /api/... which is forwarded unchanged to the server.
       '/api': {

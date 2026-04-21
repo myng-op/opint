@@ -36,7 +36,11 @@ opint/
 │       ├── logging.js        # compact formatter for realtime-WS events
 │       ├── realtime.js       # browser <-> Azure WS bridge, tool dispatch
 │       ├── realtime/
-│       │   ├── session.js    # system prompt + tool schema + audio config
+│       │   ├── session.js    # tool schema + audio config; loads prompt files
+│       │   ├── prompts/      # markdown — edit + restart to tweak persona
+│       │   │   ├── persona.md     # Anna's voice, silence discipline, opening
+│       │   │   ├── mechanics.md   # tool usage, follow-ups, closing
+│       │   │   └── guardrails.md  # ethics, neutrality, de-escalation
 │       │   └── tools.js      # get_next_interview_question handler
 │       ├── models/
 │       │   ├── QuestionSet.js
@@ -46,9 +50,12 @@ opint/
 │           └── interviews.js
 └── client/                   # React frontend (vite)
     └── src/
-        ├── App.jsx           # router shell (single route)
+        ├── App.jsx           # router shell (/, /review, /review/:id)
+        ├── theme.js          # shared color + shape tokens (#EE5A00)
         └── routes/
-            └── Interview.jsx # interviewee voice chat
+            ├── Interview.jsx     # interviewee voice chat + Anna orb
+            ├── Review.jsx        # list of past interviews (unlinked from /)
+            └── ReviewDetail.jsx  # transcript playback for one interview
 ```
 
 ## First-time setup
@@ -89,7 +96,9 @@ npm run dev        # runs server (3001) and client (5173) together
 ```
 
 - Interviewee: http://localhost:5173/
-- Health:      http://localhost:3001/health  (returns `{ ok: true, db: true }` when Mongo is up)
+- Review list: http://localhost:5173/review          (unlinked, typed-URL only)
+- Transcript:  http://localhost:5173/review/:id
+- Health:      http://localhost:3001/health          (returns `{ ok: true, db: true }` when Mongo is up)
 
 `npm run dev` auto-runs `kill-ports` first (via npm's `predev` hook) so stale
 processes from a previous crash or `Ctrl+C` can't block 3001 / 5173. If you

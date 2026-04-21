@@ -1,23 +1,37 @@
 {
   "q1": {
-    "content": "To start, could you tell me a bit about yourself and how technology has played a role in your life — either professionally or personally?",
-    "type": "qualitative",
-    "requirement": "Learn about the person's general background and their relationship with technology. Understand how central technology is to their daily life and work.",
+    "content": "Hello! My name is Anna, and I'm here to have a conversation with you about your daily life. This will be a relaxed, open-ended conversation — there are no right or wrong answers. I'm genuinely curious about your experiences and views.",
+    "type": "non-question",
+    "requirement": "",
     "condition": "",
-    "max_sec": 180
+    "max_sec": 30
   },
   "q2": {
-    "content": "Can you think of a specific moment when a piece of technology — a tool, a device, or an application — significantly changed the way you work or think about something?",
-    "type": "qualitative",
-    "requirement": "Understand a concrete turning point or memorable experience the person has had with technology. Get specific details about what changed and why it mattered to them.",
+    "content": "The conversation should take about fifteen to twenty minutes. Feel free to take your time with each question, and share as much or as little as you'd like. Let's get started!",
+    "type": "non-question",
+    "requirement": "",
     "condition": "",
-    "max_sec": 150
+    "max_sec": 15
   },
   "q3": {
-    "content": "On the flip side, is there a time when technology frustrated or let you down in a meaningful way?",
+    "content": "To start, can you tell me a bit about yourself? Start from your childhood, to education, to family and relationships, and to any major life events you may have had. I know it's a big question, so feel free to take as much time as you'd like.",
     "type": "qualitative",
-    "requirement": "Learn about a negative or frustrating experience with technology to get a balanced view of the person's relationship with it.",
+    "requirement": "Learn as much as you can about the interviewee's life experience, and their personal background. Be respectful but curious as you hear about their story.",
     "condition": "",
-    "max_sec": 120
+    "max_sec": 240
+  },
+  "q4": {
+    "content": "Tell me about how predictable your work schedule is. How would you describe your job in terms of flexibility with your hours?",
+    "type": "factual",
+    "requirement": "If the participant says they do not work, your objective is accomplished. If not, learn about the predictability and flexibility of the interviewee's work schedule.",
+    "condition": "The interviewee is currently employed.",
+    "max_sec": 30
+  },
+   "q5": {
+    "content": "And that was the last question I wanted to ask today. Thank you so much again for your time! It was really wonderful getting to know you through this interview. Now, we will take you back to the Home Screen so that you may finish the rest of the study!",
+    "type": "non-question",
+    "requirement": "",
+    "condition": "",
+    "max_sec": 0
   }
 }

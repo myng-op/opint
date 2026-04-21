@@ -176,6 +176,13 @@ Key properties:
 - **Session ownership is server-side.** System prompt, tool schema, audio
   config — all authored in `server/src/realtime/session.js`. The browser
   cannot override persona or inject tools.
+- **Prompt is modular.** `session.js` concatenates three files from
+  `server/src/realtime/prompts/` at boot: `persona.md` (voice + silence +
+  opening), `mechanics.md` (tool usage, follow-ups, closing), `guardrails.md`
+  (ethics, neutrality, de-escalation). Edit a file, restart the server, the
+  new prompt takes effect on the next WS connection.
+- **VAD silence window is 5 s.** Matches Anna's low-arousal pacing —
+  Azure's server VAD waits 5000 ms of silence before ending a user turn.
 - **AI greets first.** After `session.update` the server sends
   `response.create` with no user input, and the model emits its opening.
 - **Tool dispatch is server-side.** `response.function_call_arguments.done`

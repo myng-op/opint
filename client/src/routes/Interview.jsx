@@ -1,18 +1,38 @@
-// Interviewee surface: voice chat against Azure Realtime via the Node proxy.
-// In Phase 1 this is structurally the same as the Phase 0 voice chat — we
-// just moved it into a route so Phase 6 can add avatar + transcript toggle
-// without disturbing the top-level app shell.
+// Interviewee surface. Three phases inside one component:
+//
+//   "dashboard" — participant's study home. Shows four module cards
+//                 (consent, interview, surveys, retake) with sequential
+//                 unlock. Completion is in-memory only for now — reload
+//                 resets it. Modules 3 and 4 are permanently locked in
+//                 this phase; see Phase 9 in prompts/plan.md.
+//
+//   "consent"   — stub consent view. Placeholder text + "I consent"
+//                 button. Clicking marks module 1 complete and returns
+//                 to the dashboard. A real signed-PDF placeholder lands
+//                 in Phase 9.2.
+//
+//   "stage"     — immersive two-column view. Left (large, glass): audio-reactive
+//                 orb with Anna's face / headset icon that morphs based on who
+//                 is currently speaking. Right (narrow, glass): live transcript
+//                 with a "Live" pulse indicator. Ending the interview returns
+//                 to the dashboard and marks module 2 complete.
+//
+// Analyser plumbing for the orb:
+//   - `annaAnalyserRef` is tapped on the playback AudioContext. Every
+//     decoded chunk connects `source → analyser → destination`.
+//   - `userAnalyserRef` is tapped on the mic `MediaStreamAudioSourceNode`,
+//     running alongside the `ScriptProcessorNode` that actually ships PCM16
+//     upstream.
+//   The Orb component reads both refs on each animation frame and bounces
+//   itself via direct DOM writes (no React re-render per frame).
 
 import { useEffect, useRef, useState } from 'react';
+import { theme, primaryButton, landingAtmosphere, stageAtmosphere } from '../theme.js';
+import Orb from '../components/Orb.jsx';
+import opLogo from '../../../icons/OP_logo.png';
 
-// Azure `gpt-realtime` emits / consumes 24 kHz mono PCM16.
-// Browser WebAudio will resample mic input to this rate because we construct
-// the capture AudioContext with `sampleRate: 24000`.
 const SAMPLE_RATE = 24000;
-const VOICE = import.meta.env.VITE_AZURE_REALTIME_VOICE || 'coral';
 
-// Float32 samples ([-1, 1]) → signed 16-bit PCM. This is what Azure expects
-// in the `input_audio_buffer.append` event, base64-encoded.
 function floatToPCM16(float32) {
   const out = new Int16Array(float32.length);
   for (let i = 0; i < float32.length; i++) {
@@ -22,7 +42,6 @@ function floatToPCM16(float32) {
   return out;
 }
 
-// Chunked base64 encode to avoid "arguments too long" on big audio buffers.
 function bytesToBase64(bytes) {
   let bin = '';
   const chunk = 0x8000;
@@ -40,60 +59,104 @@ function base64ToBytes(b64) {
 }
 
 export default function Interview() {
+  const [phase, setPhase] = useState('dashboard'); // 'dashboard' | 'consent' | 'stage'
+  const [completion, setCompletion] = useState({ consent: false, interview: false });
   const [connected, setConnected] = useState(false);
-  const [recording, setRecording] = useState(false);
-  const [status, setStatus] = useState('disconnected');
+  const [status, setStatus] = useState('ready');
   const [messages, setMessages] = useState([]);
+  const [muted, setMuted] = useState(false);
+  const [micError, setMicError] = useState(null);
 
-  // Refs hold handles we don't want to trigger re-renders on:
-  // websocket, audio contexts, mic stream, and the scheduled-playback cursor.
+  // Mirrored into a ref so the ScriptProcessor callback (which closes over
+  // its own scope, not React state) sees changes without needing to
+  // re-subscribe.
+  const mutedRef = useRef(false);
+
   const wsRef = useRef(null);
   const micCtxRef = useRef(null);
   const micStreamRef = useRef(null);
   const micProcRef = useRef(null);
   const playCtxRef = useRef(null);
   const playTimeRef = useRef(0);
-  // Interview id is created server-side before the WS opens; we keep it so we
-  // can POST /end when the user disconnects.
   const interviewIdRef = useRef(null);
 
-  // Clean up everything if the component unmounts mid-call (route change, etc).
-  useEffect(() => () => disconnect(), []);
+  // Analyser refs — passed into <Orb /> by reference so the orb can read them
+  // via rAF without needing React state to propagate.
+  const annaAnalyserRef = useRef(null);
+  const userAnalyserRef = useRef(null);
 
-  // Event counters: helpful when triaging from just the console.
   const wsInCount = useRef(0);
   const audioOutCount = useRef(0);
   const audioInCount = useRef(0);
+  const transcriptBottomRef = useRef(null);
+
+  useEffect(() => () => disconnect(), []);
+
+  // Auto-scroll transcript to bottom when new turns arrive.
+  useEffect(() => {
+    transcriptBottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [messages]);
+
+  async function beginInterview() {
+    // Pre-acquire the mic on the dashboard so the permission prompt (if any)
+    // happens *before* Anna starts. Once we're in the stage the user should
+    // not have to answer a browser dialog. The stream is stashed on
+    // `micStreamRef` so `startRecording()` reuses it without re-prompting.
+    setMicError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+      });
+      micStreamRef.current = stream;
+      // Reset mute state — a freshly acquired stream is live.
+      mutedRef.current = false;
+      setMuted(false);
+    } catch (err) {
+      console.warn('[client] mic permission denied', err);
+      setMicError('Microphone access is needed for the interview. Please allow it and try again.');
+      return;
+    }
+
+    setPhase('stage');
+    // Small delay so the view has mounted before we open WS.
+    await new Promise((r) => setTimeout(r, 200));
+    await connect();
+  }
+
+  function toggleMute() {
+    setMuted((prev) => {
+      const next = !prev;
+      mutedRef.current = next;
+      // Also flip the track's `enabled` flag. Disabled tracks emit silence,
+      // but we additionally short-circuit in `onaudioprocess` below so we
+      // don't waste bandwidth sending zeros upstream.
+      micStreamRef.current?.getAudioTracks().forEach((t) => (t.enabled = !next));
+      console.log(`[client] mic ${next ? 'muted' : 'unmuted'}`);
+      return next;
+    });
+  }
 
   async function connect() {
     try {
-      // Phase 3+4 flow: ask the server for a QuestionSet, spin up an Interview row,
-      // then open the WS with that interviewId. The server owns `session.update`
-      // and the AI greeting — the browser no longer sends either.
       console.log('[client] connect() start');
       setStatus('loading question set…');
 
-      console.log('[client] GET /api/question-sets');
       const sets = await fetch('/api/question-sets').then((r) => r.json());
-      console.log('[client] question sets ←', sets);
       if (!Array.isArray(sets) || sets.length === 0) {
         setStatus('no question sets in DB — run `npm run seed`');
-        console.warn('[client] abort: no question sets');
         return;
       }
       const questionSetId = sets[0]._id;
       console.log(`[client] using questionSetId=${questionSetId} ("${sets[0].title}")`);
 
       setStatus('creating interview…');
-      console.log('[client] POST /api/interviews');
       const created = await fetch('/api/interviews', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ questionSetId }),
       }).then((r) => r.json());
-      console.log('[client] interview created ←', created);
       if (!created?._id) {
-        setStatus(`error creating interview: ${created?.error ?? 'unknown'}`);
+        setStatus(`error: ${created?.error ?? 'unknown'}`);
         return;
       }
       interviewIdRef.current = created._id;
@@ -101,36 +164,31 @@ export default function Interview() {
       setStatus('connecting…');
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${proto}//${location.host}/ws?interviewId=${created._id}`;
-      console.log(`[client] opening WS ${wsUrl}`);
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
-      // Reset counters per session so the numbers stay meaningful.
       wsInCount.current = 0;
       audioOutCount.current = 0;
       audioInCount.current = 0;
 
-      ws.onopen = () => {
+      ws.onopen = async () => {
         setConnected(true);
-        setStatus('connected — listening for greeting');
-        console.log('[client] WS open — server will send session.update + response.create upstream');
+        setStatus('Anna is preparing her greeting');
+        // Open the mic immediately so VAD can pick up the user's response to Anna's greeting.
+        try { await startRecording(); } catch (err) {
+          console.error('[client] startRecording failed', err);
+          setStatus('mic permission denied — please reload and allow mic access');
+        }
       };
       ws.onmessage = (evt) => {
         wsInCount.current++;
         let msg;
-        try { msg = JSON.parse(evt.data); } catch { console.warn('[client] non-JSON frame', evt.data); return; }
-        // Rate-limit audio delta logs. Everything else is logged in full (type-level).
+        try { msg = JSON.parse(evt.data); } catch { return; }
         if (msg.type === 'response.output_audio.delta' || msg.type === 'response.audio.delta') {
           audioOutCount.current++;
           if (audioOutCount.current === 1 || audioOutCount.current % 25 === 0) {
             console.log(`[client] ← #${wsInCount.current} audio delta x${audioOutCount.current}`);
           }
-        } else if (msg.type === 'response.output_audio_transcript.delta' || msg.type === 'response.audio_transcript.delta') {
-          console.log(`[client] ← #${wsInCount.current} ${msg.type} "${(msg.delta ?? '').slice(0, 60)}"`);
-        } else if (msg.type === 'conversation.item.input_audio_transcription.completed') {
-          console.log(`[client] ← #${wsInCount.current} ${msg.type} transcript="${(msg.transcript ?? '').slice(0, 120)}"`);
-        } else if (msg.type === 'response.function_call_arguments.done') {
-          console.log(`[client] ← #${wsInCount.current} TOOL CALL name=${msg.name} args=${msg.arguments}`);
         } else if (msg.type === 'error') {
           console.error(`[client] ← #${wsInCount.current} ERROR`, msg.error);
         } else {
@@ -140,9 +198,8 @@ export default function Interview() {
       };
       ws.onclose = (evt) => {
         setConnected(false);
-        setRecording(false);
         setStatus('disconnected');
-        console.log(`[client] WS close code=${evt.code} reason="${evt.reason}" wasClean=${evt.wasClean} — totals: in=${wsInCount.current} audioOut=${audioOutCount.current} audioIn=${audioInCount.current}`);
+        console.log(`[client] WS close code=${evt.code} — totals: in=${wsInCount.current} audioOut=${audioOutCount.current} audioIn=${audioInCount.current}`);
       };
       ws.onerror = (err) => {
         setStatus('error');
@@ -158,9 +215,8 @@ export default function Interview() {
     console.log('[client] disconnect()');
     stopRecording();
     if (interviewIdRef.current) {
-      console.log(`[client] POST /api/interviews/${interviewIdRef.current}/end (best-effort)`);
       fetch(`/api/interviews/${interviewIdRef.current}/end`, { method: 'POST' })
-        .then((r) => console.log(`[client] /end ← status=${r.status}`))
+        .then((r) => console.log(`[client] /end ← ${r.status}`))
         .catch((err) => console.warn('[client] /end failed', err.message));
     }
     interviewIdRef.current = null;
@@ -168,11 +224,27 @@ export default function Interview() {
     wsRef.current = null;
     playCtxRef.current?.close().catch(() => {});
     playCtxRef.current = null;
+    annaAnalyserRef.current = null;
   }
 
-  // Route server → client events into UI state / audio playback.
-  // We handle both the new (`response.output_audio.*`) and legacy (`response.audio.*`)
-  // event names so a preview-model swap doesn't silently break the UI.
+  function endAndReturnHome() {
+    disconnect();
+    setMessages([]);
+    setCompletion((c) => ({ ...c, interview: true }));
+    // Show a simple thank-you / end screen instead of jumping straight home
+    setPhase('ended');
+    setStatus('ready');
+  }
+
+  function startConsent() {
+    setPhase('consent');
+  }
+
+  function completeConsent() {
+    setCompletion((c) => ({ ...c, consent: true }));
+    setPhase('dashboard');
+  }
+
   function handleServerEvent(msg) {
     switch (msg.type) {
       case 'response.output_audio.delta':
@@ -191,7 +263,6 @@ export default function Interview() {
         setMessages((m) => [...m, { role: 'user', text: msg.transcript, done: true }]);
         break;
       case 'error':
-        console.error('Realtime error:', msg.error);
         setStatus(`error: ${msg.error?.message ?? 'unknown'}`);
         break;
       default:
@@ -202,7 +273,6 @@ export default function Interview() {
   function appendMessage(role, chunk) {
     setMessages((m) => {
       const last = m[m.length - 1];
-      // Merge into the in-flight bubble of the same role; start a new one otherwise.
       if (last && last.role === role && !last.done) {
         return [...m.slice(0, -1), { ...last, text: last.text + chunk }];
       }
@@ -221,120 +291,690 @@ export default function Interview() {
   }
 
   async function startRecording() {
-    console.log('[client] startRecording() — requesting mic');
-    const stream = await navigator.mediaDevices.getUserMedia({
+    // Reuse the stream acquired by `beginInterview` when possible — that
+    // pre-acquire is what keeps the permission prompt off the stage view.
+    // Only fall back to getUserMedia here if the stream was never acquired
+    // (shouldn't happen in the normal flow, but harmless as a safety net).
+    const stream = micStreamRef.current ?? await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
     });
-    console.log('[client] mic stream acquired tracks=', stream.getAudioTracks().map((t) => t.label));
     micStreamRef.current = stream;
-
-    // AudioContext at 24 kHz forces resampling of the mic input, so whatever the
-    // device's native rate is, we feed Azure exactly what it expects.
     const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
     micCtxRef.current = ctx;
 
     const source = ctx.createMediaStreamSource(stream);
-    // ScriptProcessorNode is deprecated but still the simplest way to get raw PCM
-    // in every browser today. Migrate to AudioWorklet later if it becomes a pain.
+
+    // Mic analyser — a silent branch off the source, read by the orb.
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.7;
+    source.connect(analyser);
+    userAnalyserRef.current = analyser;
+
     const proc = ctx.createScriptProcessor(4096, 1, 1);
     micProcRef.current = proc;
-
     proc.onaudioprocess = (e) => {
+      // Drop frames when the user has muted themselves. The track's
+      // `enabled=false` already means the PCM is zeros, but sending silence
+      // wastes bandwidth and would keep feeding Azure's VAD with audio it
+      // should ignore.
+      if (mutedRef.current) return;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const pcm16 = floatToPCM16(e.inputBuffer.getChannelData(0));
       const b64 = bytesToBase64(new Uint8Array(pcm16.buffer));
       ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
       audioInCount.current++;
-      // Log on first frame and every 25th so the user can see the mic is streaming
-      // without flooding the console — each ScriptProcessor tick is ~85ms at 4096 samples / 24 kHz.
       if (audioInCount.current === 1 || audioInCount.current % 25 === 0) {
-        console.log(`[client] → audio chunk #${audioInCount.current} (${b64.length}B b64)`);
+        console.log(`[client] → audio chunk #${audioInCount.current}`);
       }
     };
-
     source.connect(proc);
-    proc.connect(ctx.destination); // needed to keep `onaudioprocess` firing
-    setRecording(true);
-    console.log('[client] recording started — streaming PCM16 @ 24kHz');
+    proc.connect(ctx.destination);
+    console.log('[client] recording started — mic analyser attached');
   }
 
   function stopRecording() {
     if (!micProcRef.current && !micStreamRef.current && !micCtxRef.current) return;
-    console.log(`[client] stopRecording() — sent ${audioInCount.current} chunks this session`);
+    console.log(`[client] stopRecording — sent ${audioInCount.current} chunks`);
     micProcRef.current?.disconnect();
     micProcRef.current = null;
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
     micCtxRef.current?.close().catch(() => {});
     micCtxRef.current = null;
-    setRecording(false);
+    userAnalyserRef.current = null;
   }
 
-  // Stream playback: schedule each chunk back-to-back on a single AudioContext
-  // timeline so the audio plays gaplessly even when chunks arrive unevenly.
   function playAudioDelta(b64) {
+    // Lazy-create playback ctx + analyser on the first delta so we don't
+    // spin up an AudioContext before Anna actually starts talking.
     if (!playCtxRef.current) {
-      playCtxRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
-      playTimeRef.current = playCtxRef.current.currentTime;
+      const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+      playCtxRef.current = ctx;
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.7;
+      analyser.connect(ctx.destination);
+      annaAnalyserRef.current = analyser;
+      playTimeRef.current = ctx.currentTime;
+      console.log('[client] playback ctx + Anna analyser attached');
     }
     const ctx = playCtxRef.current;
     const bytes = base64ToBytes(b64);
     const pcm16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
     const float32 = new Float32Array(pcm16.length);
     for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 0x8000;
-
     const buf = ctx.createBuffer(1, float32.length, SAMPLE_RATE);
     buf.copyToChannel(float32, 0);
     const src = ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(ctx.destination);
-    // Start either now (if we're behind) or at the end of the last scheduled chunk.
+    // Route through the analyser instead of directly to destination — the
+    // analyser's connect-to-destination happens once at ctx creation.
+    src.connect(annaAnalyserRef.current);
     const startAt = Math.max(ctx.currentTime, playTimeRef.current);
     src.start(startAt);
     playTimeRef.current = startAt + buf.duration;
   }
 
+  if (phase === 'dashboard') {
+    return (
+      <Dashboard
+        completion={completion}
+        micError={micError}
+        onStartConsent={startConsent}
+        onStartInterview={beginInterview}
+      />
+    );
+  }
+  if (phase === 'consent') {
+    return <Consent onConsent={completeConsent} onBack={() => setPhase('dashboard')} />;
+  }
+  if (phase === 'ended') {
+    return <EndScreen onReturn={() => setPhase('dashboard')} />;
+  }
   return (
-    <div style={{ fontFamily: 'system-ui, sans-serif', maxWidth: 640, margin: '40px auto', padding: 20 }}>
-      <h1 style={{ marginBottom: 4 }}>Voice Chat</h1>
-      <div style={{ color: '#666', marginBottom: 20, fontSize: 14 }}>Status: {status}</div>
+    <Stage
+      status={status}
+      connected={connected}
+      messages={messages}
+      muted={muted}
+      onToggleMute={toggleMute}
+      annaAnalyserRef={annaAnalyserRef}
+      userAnalyserRef={userAnalyserRef}
+      onEnd={endAndReturnHome}
+      transcriptBottomRef={transcriptBottomRef}
+    />
+  );
+}
 
-      <div style={{ display: 'flex', gap: 8, marginBottom: 24 }}>
-        {!connected ? (
-          <button onClick={connect} style={btn}>Connect</button>
-        ) : (
-          <>
-            <button
-              onClick={recording ? stopRecording : startRecording}
-              style={{ ...btn, background: recording ? '#c0392b' : '#2980b9' }}
-            >
-              {recording ? 'Stop mic' : 'Start mic'}
-            </button>
-            <button onClick={disconnect} style={{ ...btn, background: '#555' }}>Disconnect</button>
-          </>
-        )}
-      </div>
+// ---- Dashboard ----
 
-      <div style={{ border: '1px solid #ddd', borderRadius: 8, padding: 12, minHeight: 200 }}>
-        {messages.length === 0 && <div style={{ color: '#999' }}>Say something…</div>}
-        {messages.map((m, i) => (
-          <div key={i} style={{ marginBottom: 10 }}>
-            <div style={{ fontSize: 12, color: '#888', textTransform: 'uppercase' }}>{m.role}</div>
-            <div>{m.text}</div>
-          </div>
-        ))}
+// Module status derivation lives next to the dashboard so the unlock
+// rules are obvious in one place. Keep this in sync with the module
+// list in `Dashboard` below.
+function deriveModuleStatuses(completion) {
+  return {
+    consent: completion.consent ? 'completed' : 'available',
+    interview: !completion.consent ? 'locked' : completion.interview ? 'completed' : 'available',
+    surveys: 'locked',      // Phase 9 design-only
+    retake: 'locked',       // unlocks 2 weeks after surveys — also Phase 9 design-only
+  };
+}
+
+function Dashboard({ completion, micError, onStartConsent, onStartInterview }) {
+  const s = deriveModuleStatuses(completion);
+  const modules = [
+    {
+      key: 'consent',
+      number: 1,
+      title: 'Study consent',
+      description: 'Review and sign the consent form before beginning.',
+      status: s.consent,
+      onStart: onStartConsent,
+    },
+    {
+      key: 'interview',
+      number: 2,
+      title: 'Interview',
+      description: 'A warm, unhurried conversation with Anna about your life.',
+      status: s.interview,
+      onStart: onStartInterview,
+    },
+/*    {
+      key: 'surveys',
+      number: 3,
+      title: 'Surveys and experiments',
+      description: 'A short set of surveys and decision-making tasks. Coming soon.',
+      status: s.surveys,
+    },
+    {
+      key: 'retake',
+      number: 4,
+      title: 'Self-consistency retake',
+      description: 'Repeats the surveys to measure consistency over time. Unlocks two weeks after module 3.',
+      status: s.retake,
+    },*/
+  ];
+
+  return (
+    <div style={landingPage}>
+      <img src={opLogo} alt="OP" style={landingLogo} />
+      <div style={dashboardInner}>
+        <h1 style={{ ...dashboardHeadline, ...rise, animationDelay: '80ms' }}>
+          Your study
+        </h1>
+        <p style={{ ...dashboardLede, ...rise, animationDelay: '200ms' }}>
+          Work through each module in order. The next one unlocks as you complete the previous.
+        </p>
+        {micError && <div style={micErrorBanner}>{micError}</div>}
+        <div style={moduleList}>
+          {modules.map((m, i) => (
+            <ModuleCard key={m.key} module={m} delay={320 + i * 90} />
+          ))}
+        </div>
       </div>
     </div>
   );
 }
 
-const btn = {
-  padding: '10px 16px',
+function ModuleCard({ module: m, delay }) {
+  const isAvailable = m.status === 'available';
+  const isCompleted = m.status === 'completed';
+  const isLocked = m.status === 'locked';
+
+  return (
+    <div style={{ ...moduleCard, ...rise, animationDelay: `${delay}ms`, opacity: isLocked ? 0.55 : 1 }}>
+      <div style={moduleNumber}>{String(m.number).padStart(2, '0')}</div>
+      <div style={moduleBody}>
+        <div style={moduleTitleRow}>
+          <span style={moduleTitle}>{m.title}</span>
+          <StatusBadge status={m.status} />
+        </div>
+        <p style={moduleDescription}>{m.description}</p>
+      </div>
+      <div style={moduleAction}>
+        {isAvailable && (
+          <button
+            onClick={m.onStart}
+            style={primaryButton()}
+            onMouseDown={(e) => (e.currentTarget.style.transform = 'scale(0.97)')}
+            onMouseUp={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+            onMouseLeave={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+          >
+            Start
+          </button>
+        )}
+        {isCompleted && <div style={completedMark}>✓ Completed</div>}
+        {isLocked && <div style={lockedMark}>Locked</div>}
+      </div>
+    </div>
+  );
+}
+
+function StatusBadge({ status }) {
+  const label = {
+    available: 'Available',
+    completed: 'Completed',
+    locked: 'Locked',
+  }[status];
+  return <span style={{ ...statusBadge, ...statusBadgeVariant[status] }}>{label}</span>;
+}
+
+// ---- Consent (stub — 9.2 will flesh this out with a placeholder PDF) ----
+
+function Consent({ onConsent, onBack }) {
+  return (
+    <div style={landingPage}>
+      <img src={opLogo} alt="OP" style={landingLogo} />
+      <div style={consentInner}>
+        <h1 style={{ ...dashboardHeadline, ...rise, animationDelay: '80ms' }}>
+          Study consent
+        </h1>
+        <p style={{ ...dashboardLede, ...rise, animationDelay: '200ms' }}>
+          (Placeholder — the signed PDF embed lands in the next phase.)
+        </p>
+        <div style={{ display: 'flex', gap: 12, ...rise, animationDelay: '320ms' }}>
+          <button
+            onClick={onConsent}
+            style={primaryButton()}
+            onMouseDown={(e) => (e.currentTarget.style.transform = 'scale(0.97)')}
+            onMouseUp={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+            onMouseLeave={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+          >
+            I consent
+          </button>
+          <button onClick={onBack} style={consentBackButton}>Back</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EndScreen({ onReturn }) {
+  return (
+    <div style={landingPage}>
+      <img src={opLogo} alt="OP" style={landingLogo} />
+      <div style={consentInner}>
+        <h1 style={{ ...dashboardHeadline, ...rise, animationDelay: '80ms' }}>Thank you</h1>
+        <p style={{ ...dashboardLede, ...rise, animationDelay: '200ms' }}>
+          Thank you for participating in the study. Your time and responses are appreciated.
+        </p>
+        <div style={{ marginTop: 12, ...rise, animationDelay: '320ms' }}>
+          <button onClick={onReturn} style={primaryButton()}>Return to home</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Stage ----
+
+function Stage({ status, connected, messages, muted, onToggleMute, annaAnalyserRef, userAnalyserRef, onEnd, transcriptBottomRef }) {
+  return (
+    <div style={stagePage}>
+      <main style={stageLayout}>
+        <section style={annaCard}>
+          <div style={cardCorner}>
+            <span style={cornerDot} />
+            <span style={cornerLabel}>Anna · AI interviewer</span>
+          </div>
+
+          <div style={orbSlot}>
+            <Orb annaAnalyser={annaAnalyserRef} userAnalyser={userAnalyserRef} size={300} />
+            <div style={annaName}>Anna</div>
+            <div style={annaStatus}>{muted ? 'You are muted' : connected ? status : 'connecting…'}</div>
+          </div>
+
+          <div style={stageControlsRow}>
+            <button
+              onClick={onToggleMute}
+              style={muted ? muteButtonActive : stageControlButton}
+              aria-pressed={muted}
+            >
+              {muted ? 'Unmute' : 'Mute'}
+            </button>
+            <button onClick={onEnd} style={stageControlButton}>End interview</button>
+          </div>
+        </section>
+
+        <aside style={transcriptCard}>
+          <div style={transcriptHeader}>
+            <span style={livePulse} />
+            <span style={liveLabel}>Live · Transcript</span>
+          </div>
+          <div style={transcriptBody}>
+            {messages.length === 0 && (
+              <div style={transcriptEmpty}>Anna will begin in a moment…</div>
+            )}
+            {messages.map((m, i) => (
+              <Bubble key={i} role={m.role} text={m.text} />
+            ))}
+            <div ref={transcriptBottomRef} />
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
+}
+
+function Bubble({ role, text }) {
+  const isAnna = role === 'assistant';
+  return (
+    <div style={{ display: 'flex', justifyContent: isAnna ? 'flex-start' : 'flex-end' }}>
+      <div style={isAnna ? bubbleAnna : bubbleUser}>
+        <div style={bubbleLabel}>{isAnna ? 'Anna' : 'You'}</div>
+        <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>
+          {text || <em style={{ opacity: 0.6 }}>…</em>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- styles ----
+
+const rise = { animation: 'riseIn 600ms ease both' };
+
+const landingPage = {
+  minHeight: '100vh',
+  background: landingAtmosphere,
+  backgroundAttachment: 'fixed',
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'center',
+  justifyContent: 'center',
+  padding: '80px 24px 120px',
+  position: 'relative',
+  overflow: 'hidden',
+};
+const landingLogo = {
+  position: 'absolute',
+  top: 32,
+  left: 40,
+  height: 36,
+  width: 'auto',
+};
+
+// -- dashboard --
+
+const dashboardInner = {
+  maxWidth: 760,
+  width: '100%',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 20,
+};
+const dashboardHeadline = {
+  fontSize: 'clamp(40px, 6vw, 64px)',
+  lineHeight: 1.05,
+  margin: 0,
+  fontWeight: 700,
+  color: theme.ink,
+  letterSpacing: '-0.02em',
+};
+const dashboardLede = {
+  fontSize: 17,
+  lineHeight: 1.55,
+  color: theme.text,
+  opacity: 0.72,
+  maxWidth: 560,
+  margin: 0,
+};
+const moduleList = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 14,
+  marginTop: 28,
+};
+const moduleCard = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 24,
+  padding: '22px 24px',
+  background: theme.surface,
+  border: `1px solid ${theme.border}`,
+  borderRadius: theme.radius,
+  boxShadow: theme.shadowSoft,
+};
+const moduleNumber = {
+  fontSize: 28,
+  fontWeight: 700,
+  color: theme.primary,
+  letterSpacing: '-0.02em',
+  minWidth: 48,
+};
+const moduleBody = {
+  flex: 1,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+};
+const moduleTitleRow = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 12,
+};
+const moduleTitle = {
+  fontSize: 18,
+  fontWeight: 600,
+  color: theme.ink,
+};
+const moduleDescription = {
+  margin: 0,
+  fontSize: 14,
+  lineHeight: 1.5,
+  color: theme.textMuted,
+};
+const moduleAction = {
+  display: 'flex',
+  alignItems: 'center',
+  minWidth: 120,
+  justifyContent: 'flex-end',
+};
+const completedMark = {
+  fontSize: 13,
+  fontWeight: 600,
+  color: theme.primaryDeep,
+  letterSpacing: '0.02em',
+};
+const lockedMark = {
+  fontSize: 13,
+  fontWeight: 500,
+  color: theme.textMuted,
+  letterSpacing: '0.02em',
+};
+const statusBadge = {
+  fontSize: 11,
+  letterSpacing: '0.12em',
+  textTransform: 'uppercase',
+  fontWeight: 700,
+  padding: '3px 8px',
+  borderRadius: 999,
+};
+const statusBadgeVariant = {
+  available: { background: 'rgba(238, 90, 0, 0.10)', color: theme.primaryDeep },
+  completed: { background: 'rgba(178, 62, 0, 0.08)', color: theme.primaryDeep },
+  locked: { background: theme.surfaceMuted, color: theme.textMuted },
+};
+const micErrorBanner = {
+  marginTop: 12,
+  padding: '12px 16px',
+  borderRadius: theme.radiusSm,
+  background: 'rgba(238, 90, 0, 0.08)',
+  border: `1px solid ${theme.primary}`,
+  color: theme.primaryDeep,
+  fontSize: 14,
+  lineHeight: 1.5,
+};
+
+// -- consent --
+
+const consentInner = {
+  maxWidth: 560,
+  width: '100%',
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'flex-start',
+  gap: 20,
+};
+const consentBackButton = {
+  padding: '14px 24px',
   fontSize: 15,
-  border: 'none',
-  borderRadius: 6,
-  color: 'white',
-  background: '#2980b9',
+  fontWeight: 500,
+  border: `1px solid ${theme.border}`,
+  borderRadius: 999,
+  color: theme.text,
+  background: theme.surface,
   cursor: 'pointer',
+};
+
+// -- stage --
+
+const stagePage = {
+  minHeight: '100vh',
+  background: stageAtmosphere,
+  backgroundAttachment: 'fixed',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  padding: '40px 24px',
+  position: 'relative',
+  overflow: 'hidden',
+};
+const stageLayout = {
+  width: '100%',
+  maxWidth: 1180,
+  display: 'flex',
+  gap: 24,
+  alignItems: 'stretch',
+  minHeight: 'min(85vh, 720px)',
+  flexWrap: 'wrap',
+};
+const glassBase = {
+  background: theme.glass,
+  backdropFilter: 'blur(18px)',
+  WebkitBackdropFilter: 'blur(18px)',
+  border: `1px solid ${theme.glassBorder}`,
+  borderRadius: theme.radiusXl,
+  boxShadow: theme.shadowDeep,
+  color: theme.textOnInk,
+};
+const annaCard = {
+  ...glassBase,
+  flex: '1 1 560px',
+  position: 'relative',
+  padding: '36px 32px 32px',
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  overflow: 'hidden',
+  minHeight: 600,
+};
+const cardCorner = {
+  position: 'absolute',
+  top: 24,
+  left: 28,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 10,
+};
+const cornerDot = {
+  width: 10,
+  height: 10,
+  borderRadius: '50%',
+  background: `linear-gradient(135deg, ${theme.primaryLight}, ${theme.primary})`,
+  boxShadow: `0 0 10px ${theme.primary}`,
+};
+const cornerLabel = {
+  fontSize: 11,
+  letterSpacing: '0.16em',
+  textTransform: 'uppercase',
+  fontWeight: 700,
+  color: theme.textOnInkMuted,
+};
+const orbSlot = {
+  flex: 1,
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 10,
+  paddingTop: 40,
+};
+const annaName = {
+  fontSize: 32,
+  fontWeight: 800,
+  color: theme.textOnInk,
+  letterSpacing: '-0.01em',
+  marginTop: 24,
+};
+const annaStatus = {
+  fontSize: 13,
+  color: theme.textOnInkMuted,
+  letterSpacing: '0.06em',
+};
+const stageControlsRow = {
+  display: 'flex',
+  gap: 12,
+  alignItems: 'center',
+};
+const stageControlButton = {
+  padding: '10px 22px',
+  fontSize: 13,
+  fontWeight: 600,
+  color: theme.textOnInk,
+  background: 'rgba(255, 240, 228, 0.08)',
+  border: `1px solid ${theme.glassBorder}`,
+  borderRadius: 999,
+  cursor: 'pointer',
+  letterSpacing: '0.04em',
+};
+// When muted the button gets the orange accent — it's the louder state,
+// the one the participant should notice if they've forgotten to un-mute.
+const muteButtonActive = {
+  ...stageControlButton,
+  background: theme.primary,
+  borderColor: theme.primary,
+  color: 'white',
+};
+
+// -- transcript --
+
+const transcriptCard = {
+  ...glassBase,
+  width: 380,
+  flex: '0 1 380px',
+  display: 'flex',
+  flexDirection: 'column',
+  overflow: 'hidden',
+  minHeight: 600,
+};
+const transcriptHeader = {
+  padding: '20px 24px 14px',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 10,
+  borderBottom: `1px solid ${theme.glassBorder}`,
+};
+const livePulse = {
+  width: 9,
+  height: 9,
+  borderRadius: '50%',
+  background: '#6EEB83',
+  boxShadow: '0 0 10px rgba(110, 235, 131, 0.7)',
+  animation: 'livePulse 2s ease-in-out infinite',
+};
+const liveLabel = {
+  fontSize: 11,
+  letterSpacing: '0.18em',
+  textTransform: 'uppercase',
+  fontWeight: 700,
+  color: theme.textOnInkMuted,
+};
+const transcriptBody = {
+  flex: 1,
+  padding: 20,
+  overflowY: 'auto',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 10,
+};
+const transcriptEmpty = {
+  color: theme.textOnInkMuted,
+  fontSize: 14,
+  fontStyle: 'italic',
+  textAlign: 'center',
+  marginTop: 40,
+};
+
+const bubbleBase = {
+  maxWidth: '88%',
+  padding: '10px 14px',
+  borderRadius: theme.radius,
+  fontSize: 14,
+  lineHeight: 1.45,
+};
+const bubbleAnna = {
+  ...bubbleBase,
+  background: 'rgba(255, 240, 228, 0.1)',
+  color: theme.textOnInk,
+  border: `1px solid ${theme.glassBorder}`,
+  borderBottomLeftRadius: 6,
+};
+const bubbleUser = {
+  ...bubbleBase,
+  background: `linear-gradient(135deg, ${theme.primary} 0%, ${theme.primaryDeep} 100%)`,
+  color: 'white',
+  borderBottomRightRadius: 6,
+  boxShadow: '0 6px 20px rgba(238, 90, 0, 0.30)',
+};
+const bubbleLabel = {
+  fontSize: 10,
+  letterSpacing: '0.16em',
+  textTransform: 'uppercase',
+  fontWeight: 700,
+  opacity: 0.7,
+  marginBottom: 4,
 };
