@@ -1,24 +1,14 @@
-// Builds the Azure Realtime `session.update` payload the server sends upstream
-// as soon as the WS opens. This is where the interviewer persona, the tool
-// definition, and the audio format all live — all in the server, never the browser.
+// Assembles the interviewer persona prompt and tool definition used by the
+// STT→LLM→TTS pipeline. The persona is split across markdown files under
+// `./prompts/` and concatenated at server start.
 //
-// The persona is split across three markdown files under `./prompts/`:
-//   - persona.md    — who Anna is, how she sounds, silence discipline, opening
-//   - mechanics.md  — tool usage, follow-ups, transitions, closing
-//   - guardrails.md — researcher/therapist boundary, neutrality, AI transparency, etc.
-// Files are read once at server start and concatenated. Edit a file, restart
-// the server, the new prompt takes effect on the next WS connection.
+// Exports:
+//   getSystemPrompt()   — full system prompt string
+//   getToolDefinition() — Chat Completions tool shape
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-const SAMPLE_RATE = 24000;
-
-// 2 seconds of silence before Azure's server VAD considers a turn ended.
-// Much longer than the default (~500ms) — matches Anna's low-arousal pacing
-// and honors the "silence is a space to think" rule in persona.md.
-const SILENCE_DURATION_MS = 500;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROMPTS_DIR = path.join(__dirname, 'prompts');
@@ -30,11 +20,14 @@ function loadPrompt(name) {
   return text;
 }
 
-// Concatenate in order: persona first (the model re-reads the top most often),
-// mechanics second (so the tool rules are near where the AI decides to call it),
-// guardrails last (they override anything above).
+// Concatenate in order:
+//   persona    — who Anna is (the model re-reads the top most often)
+//   speech     — how she vocalizes (fillers, pauses, emotion cues) — extends persona
+//   mechanics  — tool flow / item types (kept near where the AI decides to call the tool)
+//   guardrails — last, so they override anything above
 const SYSTEM_PROMPT = [
   loadPrompt('persona'),
+  loadPrompt('speech'),
   loadPrompt('mechanics'),
   loadPrompt('guardrails'),
 ].join('\n\n');
@@ -43,43 +36,49 @@ console.log(`[session] system prompt assembled: ${SYSTEM_PROMPT.length} chars to
 
 // Tool schema. No parameters: server owns the interview state, the AI just asks for "the next one".
 // Description doubles as usage guidance the AI references at call time.
+//
+// Shape: Chat Completions `tools` array element.
+// Phase C passes [getToolDefinition()] in the Chat Completions request body.
 const GET_NEXT_QUESTION_TOOL = {
   type: 'function',
-  name: 'get_next_interview_question',
-  description:
-    "Fetch the next interview item to deliver. Items have a `type`: " +
-    "`non-question` means a statement to *say* (intro, transition, or closing) — deliver it in your own voice, do NOT wait for a participant response, and immediately call this tool again to get the next item. " +
-    "`qualitative` or `factual` means a question to *ask* — deliver it, wait for the participant to answer, optionally ask ONE gentle follow-up, then call this tool again. " +
-    "Returns { key, content, type, requirement, max_sec, question_number, total_questions }, or { done: true } when the interview is complete.",
-  parameters: {
-    type: 'object',
-    properties: {},
-    required: [],
-    additionalProperties: false,
+  function: {
+    name: 'get_next_interview_question',
+    description:
+      "Fetch the next interview item to deliver. Items have a `type`: " +
+      "`non-question` means a statement to *say* (intro, transition, or closing) — deliver it in your own voice, do NOT wait for a participant response, and immediately call this tool again to get the next item. " +
+      "`qualitative` or `factual` means a question to *ask* — deliver it, wait for the participant to answer, optionally ask ONE gentle follow-up, then call this tool again. " +
+      "Returns { key, content, type, requirement, max_sec, question_number, total_questions }, or { done: true } when the interview is complete.",
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
   },
 };
 
-export function buildSessionConfig({ voice }) {
-  console.log(
-    `[session] build voice=${voice} sampleRate=${SAMPLE_RATE} vadSilence=${SILENCE_DURATION_MS}ms ` +
-      `tools=[get_next_interview_question] prompt=${SYSTEM_PROMPT.length}chars`
-  );
-  return {
-    type: 'realtime',
-    output_modalities: ['audio'],
-    audio: {
-      input: {
-        format: { type: 'audio/pcm', rate: SAMPLE_RATE },
-        turn_detection: { type: 'server_vad', silence_duration_ms: SILENCE_DURATION_MS },
-        transcription: { model: 'whisper-1' },
-      },
-      output: {
-        format: { type: 'audio/pcm', rate: SAMPLE_RATE },
-        voice,
-      },
-    },
-    instructions: SYSTEM_PROMPT,
-    tools: [GET_NEXT_QUESTION_TOOL],
-    tool_choice: 'auto',
-  };
+/** Returns the fully assembled system prompt (persona + speech + mechanics + guardrails).
+ *  When `language` is a non-English locale (e.g. "fi-FI"), a language instruction
+ *  is appended so the LLM speaks the target language throughout the interview. */
+export function getSystemPrompt(language) {
+  if (!language || language.startsWith('en')) return SYSTEM_PROMPT;
+  // Map BCP-47 locale to a human-readable language name.
+  let langName;
+  try {
+    langName = new Intl.DisplayNames(['en'], { type: 'language' }).of(language);
+  } catch {
+    langName = language;
+  }
+  const langDirective =
+    `\n\n# Language\n\n` +
+    `Conduct this entire interview in **${langName}**. ` +
+    `All your speech — greetings, questions, follow-ups, acknowledgements, ` +
+    `and closing — must be in ${langName}. ` +
+    `If the participant switches to another language, gently continue in ${langName}.`;
+  return SYSTEM_PROMPT + langDirective;
+}
+
+/** Returns the tool definition in Chat Completions shape. */
+export function getToolDefinition() {
+  return GET_NEXT_QUESTION_TOOL;
 }

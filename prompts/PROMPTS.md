@@ -110,3 +110,49 @@ Produced:
 - README / ARCHITECTURE / plan / PROMPTS all updated to match.
 - Phase 5 scope locked: transcript persistence goes to Mongo
   (`TranscriptTurn` collection), JSON export is deferred / optional.
+
+## Conversation-flow fix — Anna stepping on her own lines + natural speech
+
+> it said the next question while still reading the previous question. it's too
+> much chaos in the speech. it doesn't wait for user to answer the question
+> …
+> a. yes, fix bug 3 for now. I will also give you a prompt guide to add a great
+> prompt for anna to talk more naturally
+
+Three stacked bugs were causing the overlap and the missing pause after the
+greeting:
+
+1. **`condition` field never reached the model.** The greeting's
+   `condition` told Anna to wait for the participant, but `tools.js` only
+   forwarded `key/content/type/requirement/max_sec/question_number/
+   total_questions`. The field was silently dropped.
+2. **All three opening items were `non-question`.** `mechanics.md` tells the
+   model to *immediately* call the tool again after any non-question item, so
+   the greeting + intro + pacing note got rattled off back-to-back with no
+   pauses.
+3. **Proxy kicked off `response.create` on `response.function_call_arguments
+   .done`.** That event only means the function-call *item* is complete — the
+   enclosing response may still be streaming audio. Firing the next response
+   immediately caused Anna's voice lines to step on each other.
+
+Produced:
+- `interviews/sample_interview.json`: q1 `type` flipped from `non-question` to
+  `qualitative` so Anna waits for a greeting response by default. Stale
+  `condition` text removed.
+- `server/src/realtime.js`: added a `pendingResponseCreate` flag. We submit the
+  `function_call_output` immediately (that just appends to the conversation),
+  but defer `response.create` until the in-flight `response.done` arrives.
+- `server/src/realtime/prompts/speech.md` (new): natural-speech prompt —
+  filler words, `<break>` pause hints, `<emotion>` cues, `[laughter]`,
+  bad-vs-good examples, a "LEAN INTO THIS HARD" recap. Written to sit on top
+  of the existing Finnish-calm persona rather than replace it.
+- `server/src/realtime/session.js`: loads `speech.md` between `persona` and
+  `mechanics` in the system-prompt stack.
+
+Caveats noted to user:
+- Azure Realtime generates audio end-to-end, not via a TTS layer — so
+  `<break time="..."/>`, `<emotion value="..." />`, and `[laughter]` are
+  *hints*, not hard controls. They influence delivery via pattern-matching,
+  not SSML parsing.
+- The greeting change requires `npm run seed` to take effect in Mongo.
+- Tested by the user in-browser (UI/voice cannot be verified from here).

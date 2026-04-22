@@ -59,13 +59,14 @@ function base64ToBytes(b64) {
 }
 
 export default function Interview() {
-  const [phase, setPhase] = useState('dashboard'); // 'dashboard' | 'consent' | 'stage'
+  const [phase, setPhase] = useState('dashboard'); // 'dashboard' | 'consent' | 'language' | 'stage' | 'ended'
   const [completion, setCompletion] = useState({ consent: false, interview: false });
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState('ready');
   const [messages, setMessages] = useState([]);
   const [muted, setMuted] = useState(false);
   const [micError, setMicError] = useState(null);
+  const [selectedLanguage, setSelectedLanguage] = useState('en-US');
 
   // Mirrored into a ref so the ScriptProcessor callback (which closes over
   // its own scope, not React state) sees changes without needing to
@@ -78,6 +79,7 @@ export default function Interview() {
   const micProcRef = useRef(null);
   const playCtxRef = useRef(null);
   const playTimeRef = useRef(0);
+  const activeSourcesRef = useRef([]);
   const interviewIdRef = useRef(null);
 
   // Analyser refs — passed into <Orb /> by reference so the orb can read them
@@ -97,30 +99,34 @@ export default function Interview() {
     transcriptBottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages]);
 
-  async function beginInterview() {
-    // Pre-acquire the mic on the dashboard so the permission prompt (if any)
-    // happens *before* Anna starts. Once we're in the stage the user should
-    // not have to answer a browser dialog. The stream is stashed on
-    // `micStreamRef` so `startRecording()` reuses it without re-prompting.
+  // Show the language picker before starting the interview proper.
+  function startLanguageSelection() {
+    setPhase('language');
+  }
+
+  async function beginInterview(lang) {
+    const chosenLang = lang || selectedLanguage;
+    setSelectedLanguage(chosenLang);
+
+    // Pre-acquire the mic so the permission prompt happens before Anna starts.
     setMicError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
       });
       micStreamRef.current = stream;
-      // Reset mute state — a freshly acquired stream is live.
       mutedRef.current = false;
       setMuted(false);
     } catch (err) {
       console.warn('[client] mic permission denied', err);
       setMicError('Microphone access is needed for the interview. Please allow it and try again.');
+      setPhase('language');
       return;
     }
 
     setPhase('stage');
-    // Small delay so the view has mounted before we open WS.
     await new Promise((r) => setTimeout(r, 200));
-    await connect();
+    await connect(chosenLang);
   }
 
   function toggleMute() {
@@ -136,9 +142,9 @@ export default function Interview() {
     });
   }
 
-  async function connect() {
+  async function connect(lang) {
     try {
-      console.log('[client] connect() start');
+      console.log(`[client] connect() start lang=${lang}`);
       setStatus('loading question set…');
 
       const sets = await fetch('/api/question-sets').then((r) => r.json());
@@ -150,10 +156,24 @@ export default function Interview() {
       console.log(`[client] using questionSetId=${questionSetId} ("${sets[0].title}")`);
 
       setStatus('creating interview…');
+
+      // Map the chosen BCP-47 locale to the best available Azure TTS voice.
+      // DragonHD where available, standard Neural for the rest.
+      const voiceMap = {
+        'en-US': 'en-US-Ava:DragonHDLatestNeural',
+        'fi-FI': 'fi-FI-NooraNeural',
+        'sv-SE': 'sv-SE-SofieNeural',
+        'zh-CN': 'zh-CN-Xiaochen:DragonHDLatestNeural',
+        'ar-SA': 'ar-SA-ZariyahNeural',
+        'so-SO': 'so-SO-UbaxNeural',
+        'vi-VN': 'vi-VN-HoaiMyNeural',
+      };
+      const ttsVoice = voiceMap[lang] || '';
+
       const created = await fetch('/api/interviews', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ questionSetId }),
+        body: JSON.stringify({ questionSetId, language: lang, ttsVoice }),
       }).then((r) => r.json());
       if (!created?._id) {
         setStatus(`error: ${created?.error ?? 'unknown'}`);
@@ -262,6 +282,9 @@ export default function Interview() {
       case 'conversation.item.input_audio_transcription.completed':
         setMessages((m) => [...m, { role: 'user', text: msg.transcript, done: true }]);
         break;
+      case 'response.cancelled':
+        flushPlayback();
+        break;
       case 'error':
         setStatus(`error: ${msg.error?.message ?? 'unknown'}`);
         break;
@@ -346,6 +369,16 @@ export default function Interview() {
     userAnalyserRef.current = null;
   }
 
+  function flushPlayback() {
+    // Barge-in: stop all scheduled BufferSources so Anna's voice cuts immediately.
+    for (const s of activeSourcesRef.current) {
+      try { s.stop(0); } catch { /* already stopped */ }
+    }
+    activeSourcesRef.current = [];
+    if (playCtxRef.current) playTimeRef.current = playCtxRef.current.currentTime;
+    console.log('[client] flushPlayback — barge-in');
+  }
+
   function playAudioDelta(b64) {
     // Lazy-create playback ctx + analyser on the first delta so we don't
     // spin up an AudioContext before Anna actually starts talking.
@@ -375,6 +408,10 @@ export default function Interview() {
     const startAt = Math.max(ctx.currentTime, playTimeRef.current);
     src.start(startAt);
     playTimeRef.current = startAt + buf.duration;
+    activeSourcesRef.current.push(src);
+    src.onended = () => {
+      activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== src);
+    };
   }
 
   if (phase === 'dashboard') {
@@ -383,12 +420,23 @@ export default function Interview() {
         completion={completion}
         micError={micError}
         onStartConsent={startConsent}
-        onStartInterview={beginInterview}
+        onStartInterview={startLanguageSelection}
       />
     );
   }
   if (phase === 'consent') {
     return <Consent onConsent={completeConsent} onBack={() => setPhase('dashboard')} />;
+  }
+  if (phase === 'language') {
+    return (
+      <LanguagePicker
+        selected={selectedLanguage}
+        onSelect={setSelectedLanguage}
+        onConfirm={() => beginInterview(selectedLanguage)}
+        onBack={() => setPhase('dashboard')}
+        micError={micError}
+      />
+    );
   }
   if (phase === 'ended') {
     return <EndScreen onReturn={() => setPhase('dashboard')} />;
@@ -568,12 +616,71 @@ function EndScreen({ onReturn }) {
   );
 }
 
+// ---- Language Picker ----
+
+const LANGUAGE_OPTIONS = [
+  { code: 'en-US', label: 'English', flag: '🇺🇸' },
+  { code: 'fi-FI', label: 'Suomi', flag: '🇫🇮' },
+  { code: 'sv-SE', label: 'Svenska', flag: '🇸🇪' },
+  { code: 'zh-CN', label: '中文', flag: '🇨🇳' },
+  { code: 'ar-SA', label: 'العربية', flag: '🇸🇦' },
+  { code: 'so-SO', label: 'Soomaali', flag: '🇸🇴' },
+  { code: 'vi-VN', label: 'Tiếng Việt', flag: '🇻🇳' },
+];
+
+function LanguagePicker({ selected, onSelect, onConfirm, onBack, micError }) {
+  return (
+    <div style={landingPage}>
+      <img src={opLogo} alt="OP" style={landingLogo} />
+      <div style={consentInner}>
+        <h1 style={{ ...dashboardHeadline, ...rise, animationDelay: '80ms' }}>
+          Choose your language
+        </h1>
+        <p style={{ ...dashboardLede, ...rise, animationDelay: '200ms' }}>
+          Anna will conduct the interview in the language you choose.
+        </p>
+        {micError && <div style={micErrorBanner}>{micError}</div>}
+        <div style={{ ...langGrid, ...rise, animationDelay: '320ms' }}>
+          {LANGUAGE_OPTIONS.map((opt) => (
+            <button
+              key={opt.code}
+              onClick={() => onSelect(opt.code)}
+              style={{
+                ...langOption,
+                ...(selected === opt.code ? langOptionSelected : {}),
+              }}
+            >
+              <span style={langFlag}>{opt.flag}</span>
+              <span>{opt.label}</span>
+            </button>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: 12, marginTop: 24, ...rise, animationDelay: '440ms' }}>
+          <button
+            onClick={onConfirm}
+            style={primaryButton()}
+            onMouseDown={(e) => (e.currentTarget.style.transform = 'scale(0.97)')}
+            onMouseUp={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+            onMouseLeave={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+          >
+            Continue
+          </button>
+          <button onClick={onBack} style={consentBackButton}>Back</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---- Stage ----
 
 function Stage({ status, connected, messages, muted, onToggleMute, annaAnalyserRef, userAnalyserRef, onEnd, transcriptBottomRef }) {
+  // Find Anna's latest (most recent) message to display below the orb.
+  const latestAnna = [...messages].reverse().find((m) => m.role === 'assistant');
+
   return (
     <div style={stagePage}>
-      <main style={stageLayout}>
+      <main style={stageLayoutColumn}>
         <section style={annaCard}>
           <div style={cardCorner}>
             <span style={cornerDot} />
@@ -581,7 +688,7 @@ function Stage({ status, connected, messages, muted, onToggleMute, annaAnalyserR
           </div>
 
           <div style={orbSlot}>
-            <Orb annaAnalyser={annaAnalyserRef} userAnalyser={userAnalyserRef} size={300} />
+            <Orb annaAnalyser={annaAnalyserRef} userAnalyser={userAnalyserRef} size={200} />
             <div style={annaName}>Anna</div>
             <div style={annaStatus}>{muted ? 'You are muted' : connected ? status : 'connecting…'}</div>
           </div>
@@ -598,39 +705,19 @@ function Stage({ status, connected, messages, muted, onToggleMute, annaAnalyserR
           </div>
         </section>
 
-        <aside style={transcriptCard}>
-          <div style={transcriptHeader}>
-            <span style={livePulse} />
-            <span style={liveLabel}>Live · Transcript</span>
+        <div style={currentQuestionStrip}>
+          <span style={livePulse} />
+          <div style={currentQuestionText}>
+            {latestAnna
+              ? latestAnna.text
+              : <span style={{ opacity: 0.5, fontStyle: 'italic' }}>Anna will begin in a moment…</span>}
           </div>
-          <div style={transcriptBody}>
-            {messages.length === 0 && (
-              <div style={transcriptEmpty}>Anna will begin in a moment…</div>
-            )}
-            {messages.map((m, i) => (
-              <Bubble key={i} role={m.role} text={m.text} />
-            ))}
-            <div ref={transcriptBottomRef} />
-          </div>
-        </aside>
+        </div>
       </main>
     </div>
   );
 }
 
-function Bubble({ role, text }) {
-  const isAnna = role === 'assistant';
-  return (
-    <div style={{ display: 'flex', justifyContent: isAnna ? 'flex-start' : 'flex-end' }}>
-      <div style={isAnna ? bubbleAnna : bubbleUser}>
-        <div style={bubbleLabel}>{isAnna ? 'Anna' : 'You'}</div>
-        <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>
-          {text || <em style={{ opacity: 0.6 }}>…</em>}
-        </div>
-      </div>
-    </div>
-  );
-}
 
 // ---- styles ----
 
@@ -789,6 +876,41 @@ const consentBackButton = {
   cursor: 'pointer',
 };
 
+// -- language picker --
+
+const langGrid = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
+  gap: 10,
+  width: '100%',
+  maxWidth: 560,
+  marginTop: 8,
+};
+const langOption = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 10,
+  padding: '14px 18px',
+  fontSize: 15,
+  fontWeight: 500,
+  borderWidth: 1,
+  borderStyle: 'solid',
+  borderColor: theme.border,
+  borderRadius: theme.radius,
+  background: theme.surface,
+  color: theme.text,
+  cursor: 'pointer',
+  transition: 'border-color 150ms, box-shadow 150ms',
+};
+const langOptionSelected = {
+  borderColor: theme.accent ?? '#4F46E5',
+  boxShadow: `0 0 0 2px ${theme.accent ?? '#4F46E5'}33`,
+};
+const langFlag = {
+  fontSize: 22,
+  lineHeight: 1,
+};
+
 // -- stage --
 
 const stagePage = {
@@ -811,6 +933,16 @@ const stageLayout = {
   minHeight: 'min(85vh, 720px)',
   flexWrap: 'wrap',
 };
+const stageLayoutColumn = {
+  width: '100%',
+  maxWidth: 520,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 16,
+  alignItems: 'stretch',
+  // Push the question strip to just below the vertical centre.
+  marginTop: '8vh',
+};
 const glassBase = {
   background: theme.glass,
   backdropFilter: 'blur(18px)',
@@ -822,15 +954,15 @@ const glassBase = {
 };
 const annaCard = {
   ...glassBase,
-  flex: '1 1 560px',
+  flex: '0 0 auto',
   position: 'relative',
-  padding: '36px 32px 32px',
+  padding: '28px 28px 24px',
   display: 'flex',
   flexDirection: 'column',
   alignItems: 'center',
   justifyContent: 'space-between',
   overflow: 'hidden',
-  minHeight: 600,
+  minHeight: 380,
 };
 const cardCorner = {
   position: 'absolute',
@@ -860,15 +992,15 @@ const orbSlot = {
   flexDirection: 'column',
   alignItems: 'center',
   justifyContent: 'center',
-  gap: 10,
-  paddingTop: 40,
+  gap: 8,
+  paddingTop: 20,
 };
 const annaName = {
-  fontSize: 32,
+  fontSize: 24,
   fontWeight: 800,
   color: theme.textOnInk,
   letterSpacing: '-0.01em',
-  marginTop: 24,
+  marginTop: 14,
 };
 const annaStatus = {
   fontSize: 13,
@@ -900,81 +1032,30 @@ const muteButtonActive = {
   color: 'white',
 };
 
-// -- transcript --
+// -- current-question strip (below Anna card) --
 
-const transcriptCard = {
+const currentQuestionStrip = {
   ...glassBase,
-  width: 380,
-  flex: '0 1 380px',
   display: 'flex',
-  flexDirection: 'column',
-  overflow: 'hidden',
-  minHeight: 600,
+  alignItems: 'flex-start',
+  gap: 14,
+  padding: '18px 24px',
 };
-const transcriptHeader = {
-  padding: '20px 24px 14px',
-  display: 'flex',
-  alignItems: 'center',
-  gap: 10,
-  borderBottom: `1px solid ${theme.glassBorder}`,
+const currentQuestionText = {
+  fontSize: 15,
+  lineHeight: 1.55,
+  color: theme.textOnInk,
+  whiteSpace: 'pre-wrap',
 };
 const livePulse = {
   width: 9,
   height: 9,
+  flexShrink: 0,
+  marginTop: 6,
   borderRadius: '50%',
   background: '#6EEB83',
   boxShadow: '0 0 10px rgba(110, 235, 131, 0.7)',
   animation: 'livePulse 2s ease-in-out infinite',
 };
-const liveLabel = {
-  fontSize: 11,
-  letterSpacing: '0.18em',
-  textTransform: 'uppercase',
-  fontWeight: 700,
-  color: theme.textOnInkMuted,
-};
-const transcriptBody = {
-  flex: 1,
-  padding: 20,
-  overflowY: 'auto',
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 10,
-};
-const transcriptEmpty = {
-  color: theme.textOnInkMuted,
-  fontSize: 14,
-  fontStyle: 'italic',
-  textAlign: 'center',
-  marginTop: 40,
-};
 
-const bubbleBase = {
-  maxWidth: '88%',
-  padding: '10px 14px',
-  borderRadius: theme.radius,
-  fontSize: 14,
-  lineHeight: 1.45,
-};
-const bubbleAnna = {
-  ...bubbleBase,
-  background: 'rgba(255, 240, 228, 0.1)',
-  color: theme.textOnInk,
-  border: `1px solid ${theme.glassBorder}`,
-  borderBottomLeftRadius: 6,
-};
-const bubbleUser = {
-  ...bubbleBase,
-  background: `linear-gradient(135deg, ${theme.primary} 0%, ${theme.primaryDeep} 100%)`,
-  color: 'white',
-  borderBottomRightRadius: 6,
-  boxShadow: '0 6px 20px rgba(238, 90, 0, 0.30)',
-};
-const bubbleLabel = {
-  fontSize: 10,
-  letterSpacing: '0.16em',
-  textTransform: 'uppercase',
-  fontWeight: 700,
-  opacity: 0.7,
-  marginBottom: 4,
-};
+

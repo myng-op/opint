@@ -30,6 +30,12 @@ const InterviewSchema = new mongoose.Schema(
 
     startedAt: Date,
     endedAt: Date,
+
+    // Per-interview language chosen by the participant before the session
+    // starts. Drives STT locale, TTS voice, and LLM language instruction.
+    // Empty string = fall back to global config/.env defaults.
+    language: { type: String, default: '' },  // BCP-47, e.g. "en-US", "fi-FI"
+    ttsVoice: { type: String, default: '' },  // Azure voice name override
   },
   { timestamps: true }
 );

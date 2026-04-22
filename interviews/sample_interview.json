@@ -1,37 +1,37 @@
 {
   "q1": {
-    "content": "Hello! My name is Anna, and I'm here to have a conversation with you about your daily life. This will be a relaxed, open-ended conversation — there are no right or wrong answers. I'm genuinely curious about your experiences and views.",
+    "content": "Hello! My name is Anna, and I'm an AI assistant who will be conducting today's interview with you. Thank you so much for choosing to participate in our study! I'm just an AI, so please be very patient with me as sometimes I can be slow, but I'm fully attentive to you, I promise! This is a semi-structured interview. For completeness, I may ask a few questions that might seem repetitive along the way. This interview will cover your life experiences as well as your views on various social topics.",
     "type": "non-question",
-    "requirement": "",
-    "condition": "",
-    "max_sec": 30
-  },
-  "q2": {
-    "content": "The conversation should take about fifteen to twenty minutes. Feel free to take your time with each question, and share as much or as little as you'd like. Let's get started!",
-    "type": "non-question",
-    "requirement": "",
+    "requirement": "Set a friendly, patient tone and establish the structure of the interview. Use a cheeky, engaging persona.",
     "condition": "",
     "max_sec": 15
   },
-  "q3": {
-    "content": "To start, can you tell me a bit about yourself? Start from your childhood, to education, to family and relationships, and to any major life events you may have had. I know it's a big question, so feel free to take as much time as you'd like.",
-    "type": "qualitative",
-    "requirement": "Learn as much as you can about the interviewee's life experience, and their personal background. Be respectful but curious as you hear about their story.",
+  "q2": {
+    "content": "To start, please tell me your name, age and gender.",
+    "type": "factual",
+    "requirement": "Collect basic demographic information from the participant. Ask more questions if the participant's answer is incomplete (e.g. they only say their name).",
     "condition": "",
-    "max_sec": 240
+    "max_sec": 10
+  },
+  "q3": {
+    "content": "How long have you been living in Finland?",
+    "type": "factual",
+    "requirement": "Establish the duration of the participant's residency in Finland.",
+    "condition": "",
+    "max_sec": 5
   },
   "q4": {
-    "content": "Tell me about how predictable your work schedule is. How would you describe your job in terms of flexibility with your hours?",
-    "type": "factual",
-    "requirement": "If the participant says they do not work, your objective is accomplished. If not, learn about the predictability and flexibility of the interviewee's work schedule.",
-    "condition": "The interviewee is currently employed.",
-    "max_sec": 30
-  },
-   "q5": {
-    "content": "And that was the last question I wanted to ask today. Thank you so much again for your time! It was really wonderful getting to know you through this interview. Now, we will take you back to the Home Screen so that you may finish the rest of the study!",
-    "type": "non-question",
-    "requirement": "",
+    "content": "How has your life changed since you moved to Finland?",
+    "type": "qualitative",
+    "requirement": "Understand the impact of relocation on the participant's life. Look for comparisons between their past and current situation.",
     "condition": "",
-    "max_sec": 0
+    "max_sec": 60
+  },
+  "q5": {
+    "content": "Can you tell me about a difficult time you had as a foreigner in this country?",
+    "type": "qualitative",
+    "requirement": "Explore the challenges and personal struggles the participant has faced during their integration. Be empathetic and supportive.",
+    "condition": "",
+    "max_sec": 120
   }
 }

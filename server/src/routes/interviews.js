@@ -56,7 +56,7 @@ interviewsRouter.get('/', async (_req, res) => {
 // exists here (not at WS open time) so the browser gets a clean 4xx if the
 // admin deleted the set between page load and start.
 interviewsRouter.post('/', async (req, res) => {
-  const { questionSetId } = req.body ?? {};
+  const { questionSetId, language, ttsVoice } = req.body ?? {};
   if (!mongoose.isValidObjectId(questionSetId)) {
     console.warn(`[api] create interview REJECT invalid questionSetId=${questionSetId}`);
     return res.status(400).json({ error: 'questionSetId required' });
@@ -67,13 +67,18 @@ interviewsRouter.post('/', async (req, res) => {
     return res.status(404).json({ error: 'question set not found' });
   }
 
-  const doc = await Interview.create({ questionSetId });
-  console.log(`[api] interview created id=${doc._id} against set="${set.title}" (${questionSetId})`);
+  const doc = await Interview.create({
+    questionSetId,
+    language: language || '',
+    ttsVoice: ttsVoice || '',
+  });
+  console.log(`[api] interview created id=${doc._id} against set="${set.title}" (${questionSetId}) lang=${doc.language || 'default'}`);
   res.status(201).json({
     _id: doc._id,
     questionSetId: doc.questionSetId,
     status: doc.status,
     currentIndex: doc.currentIndex,
+    language: doc.language,
     createdAt: doc.createdAt,
   });
 });

@@ -1,45 +1,134 @@
-// WebSocket proxy between the browser and Azure's Realtime API.
+// STT → LLM → TTS pipeline. Replaces the Azure Realtime WS proxy.
 //
-// Responsibilities (Phase 3 + 4):
-//   1. Each browser WS connects with `?interviewId=<id>`. We look up the
-//      Interview + QuestionSet before opening the upstream WS — if either is
-//      missing, we reject so the conversation can't start against empty state.
-//   2. We own `session.update`: system prompt + tool definition + audio config
-//      are all authored server-side. The browser never sees them.
-//   3. We kick the model off with `response.create` immediately, so the AI
-//      greets first instead of waiting for the participant to speak.
-//   4. We intercept `response.function_call_arguments.done` events, resolve
-//      the tool server-side (reads Mongo, advances `currentIndex`), and return
-//      the result via `conversation.item.create` + another `response.create`.
+// Per-connection flow:
+//   1. Browser opens WS with ?interviewId=<id>. We validate Interview + QuestionSet.
+//   2. Azure Speech SDK SpeechRecognizer receives streaming PCM16 from the browser
+//      via a PushAudioInputStream. When a final recognition fires, we call the LLM.
+//   3. LLM (Azure AI Foundry Chat Completions) processes conversation history +
+//      tool definitions. Tool calls loop until the model produces final text.
+//   4. Azure Speech SDK SpeechSynthesizer converts the text to PCM16 audio and
+//      streams it back to the browser in the same frame format the client already expects.
 //
-// Logging note: each connection gets a short hash-id (cid) so you can follow
-// one conversation's log lines when multiple WS sessions are alive.
+// Frame contract with the browser (unchanged from the Realtime era):
+//   Browser → server: { type: 'input_audio_buffer.append', audio: '<base64 PCM16>' }
+//   Server → browser: { type: 'response.audio.delta', delta: '<base64 PCM16>' }
+//                      { type: 'response.audio_transcript.delta', delta: '...' }
+//                      { type: 'response.audio_transcript.done', transcript: '...' }
+//                      { type: 'conversation.item.input_audio_transcription.completed', transcript: '...' }
+//                      { type: 'response.cancelled' }   (barge-in)
 
-import { URL } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
+import sdk from 'microsoft-cognitiveservices-speech-sdk';
 import { config } from './config.js';
 import { Interview } from './models/Interview.js';
 import { QuestionSet } from './models/QuestionSet.js';
 import { TranscriptTurn } from './models/TranscriptTurn.js';
-import { buildSessionConfig } from './realtime/session.js';
+import { getSystemPrompt, getToolDefinition } from './realtime/session.js';
 import { handleToolCall } from './realtime/tools.js';
-import { describeEvent } from './logging.js';
 
-function buildUpstreamUrl() {
-  const url = new URL(config.azure.endpoint);
-  const path = url.pathname.replace(/\/$/, '') + '/realtime';
-  const params = new URLSearchParams({ model: config.azure.model });
-  if (config.azure.apiVersion) params.set('api-version', config.azure.apiVersion);
-  return `wss://${url.host}${path}?${params.toString()}`;
+// Strip SSML-like tags the LLM may still emit. DragonHD auto-detects
+// emotion and paralinguistics from plaintext — we just need clean text.
+function stripTags(text) {
+  return text
+    .replace(/<emotion\s+value="[^"]*"\s*\/?>/gi, '')
+    .replace(/<\/emotion\s*>/gi, '')
+    .replace(/<break\s+[^>]*\/>/gi, '')
+    .trim();
 }
 
-// Short per-connection id so logs from concurrent sessions stay readable.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 let cidCounter = 0;
 function nextCid() { cidCounter = (cidCounter + 1) % 1000; return `cid${cidCounter.toString().padStart(3, '0')}`; }
 
-// Server-picked default voice. Pulled from env so the interviewer voice stays
-// consistent and isn't something the browser can override.
-const VOICE = process.env.VITE_AZURE_REALTIME_VOICE || 'coral';
+function send(client, obj) {
+  if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(obj));
+}
+
+function b64ToInt16(b64) {
+  const bin = Buffer.from(b64, 'base64');
+  return new Int16Array(bin.buffer, bin.byteOffset, bin.byteLength / 2);
+}
+
+function bufferToBase64(buf) {
+  return Buffer.from(buf).toString('base64');
+}
+
+// ---------------------------------------------------------------------------
+// LLM — Azure AI Foundry Chat Completions via fetch
+// ---------------------------------------------------------------------------
+
+async function chatCompletion(messages, tools, toolChoice = 'auto') {
+  // Azure OpenAI expects: {host}/openai/deployments/{dep}/chat/completions
+  // Strip any trailing path segments like /openai/v1 from the configured endpoint.
+  const base = config.llm.endpoint.replace(/\/openai\/v\d+\/?$/, '').replace(/\/$/, '');
+  const url =
+    `${base}/openai/deployments/${config.llm.deployment}` +
+    `/chat/completions?api-version=${config.llm.apiVersion}`;
+  const body = { messages, tools, tool_choice: toolChoice };
+  console.log(`[llm] POST ${url} messages=${messages.length} tools=${tools.length} tool_choice=${JSON.stringify(toolChoice)}`);
+  const started = Date.now();
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': config.llm.apiKey,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(60_000), // 60s hard timeout
+  });
+  const elapsed = Date.now() - started;
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`LLM ${res.status} (${elapsed}ms): ${text.slice(0, 300)}`);
+  }
+  const json = await res.json();
+  const choice = json.choices?.[0];
+  console.log(
+    `[llm] ← ${res.status} (${elapsed}ms) finish=${choice?.finish_reason}` +
+    (choice?.message?.tool_calls ? ` tool_calls=${choice.message.tool_calls.length}` : '') +
+    (choice?.message?.content ? ` content="${choice.message.content.slice(0, 80)}…"` : '')
+  );
+  return json;
+}
+
+// ---------------------------------------------------------------------------
+// STT — Azure Speech SDK continuous recognition on a PushAudioInputStream
+// ---------------------------------------------------------------------------
+
+function createRecognizer(cid, { language } = {}) {
+  const lang = language || config.stt.language;
+  const speechConfig = sdk.SpeechConfig.fromSubscription(config.stt.key, config.stt.region);
+  speechConfig.speechRecognitionLanguage = lang;
+  // 16-bit PCM mono 24 kHz — matches the browser's capture format.
+  const format = sdk.AudioStreamFormat.getWaveFormatPCM(24000, 16, 1);
+  const pushStream = sdk.AudioInputStream.createPushStream(format);
+  const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
+  const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+  console.log(`[rt ${cid}] STT recognizer created lang=${lang}`);
+  return { recognizer, pushStream };
+}
+
+// ---------------------------------------------------------------------------
+// TTS — Azure Speech SDK synthesizer (PCM16 24kHz mono)
+// ---------------------------------------------------------------------------
+
+function createSynthesizer({ voice } = {}) {
+  const v = voice || config.tts.voice;
+  const speechConfig = sdk.SpeechConfig.fromSubscription(config.tts.key, config.tts.region);
+  // Raw PCM 24kHz 16-bit mono — same format the browser expects.
+  speechConfig.speechSynthesisOutputFormat =
+    sdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm;
+  speechConfig.speechSynthesisVoiceName = v;
+  // null audioConfig = pull mode (we pull the audio stream ourselves)
+  return new sdk.SpeechSynthesizer(speechConfig, null);
+}
+
+// ---------------------------------------------------------------------------
+// Main export
+// ---------------------------------------------------------------------------
 
 export function attachRealtimeProxy(httpServer) {
   const wss = new WebSocketServer({ server: httpServer });
@@ -58,7 +147,7 @@ export function attachRealtimeProxy(httpServer) {
       return;
     }
 
-    // ---- Handshake: load Interview + QuestionSet before touching Azure ----
+    // ---- Handshake: load Interview + QuestionSet ----
     const interview = await Interview.findById(interviewId).catch((err) => {
       console.error(`[rt ${cid}] interview lookup threw:`, err.message);
       return null;
@@ -78,9 +167,14 @@ export function attachRealtimeProxy(httpServer) {
     }
     console.log(`[rt ${cid}] questionSet loaded title="${questionSet.title}" questions=${questionSet.questions.length}`);
 
-    // Seed the per-interview transcript sequence counter. Using countDocuments
-    // means reconnects to the same Interview keep monotonic numbering instead
-    // of restarting at 0.
+    // ---- Per-interview language settings ----
+    // The participant chooses their language before the session starts;
+    // it's stored on the Interview doc. Empty = fall back to config/.env defaults.
+    const connLanguage = interview.language || config.stt.language;
+    const connVoice = interview.ttsVoice || config.tts.voice;
+    console.log(`[rt ${cid}] language=${connLanguage} voice=${connVoice}`);
+
+    // Transcript sequence counter (monotonic across reconnects).
     let turnSequence = await TranscriptTurn.countDocuments({ interviewId }).catch(() => 0);
     console.log(`[rt ${cid}] transcript sequence seeded at ${turnSequence}`);
 
@@ -99,127 +193,349 @@ export function attachRealtimeProxy(httpServer) {
       }
     }
 
-    // ---- Open upstream WS to Azure ----
-    const upstreamUrl = buildUpstreamUrl();
-    console.log(`[rt ${cid}] opening upstream ${upstreamUrl}`);
-    const upstream = new WebSocket(upstreamUrl, {
-      headers: { 'api-key': config.azure.apiKey },
-    });
+    // ---- Per-connection state ----
+    let browserInCount = 0;
+    let audioOutCount = 0;
 
-    // Counters make it easy to see flow volume at a glance during debugging.
-    let browserInCount = 0;     // audio frames from browser
-    let upstreamInCount = 0;    // events from Azure (all types)
-    let audioOutCount = 0;      // audio deltas from Azure
-    let upstreamReady = false;
-    const pending = [];         // browser frames buffered until upstream open
+    const conversationHistory = [
+      { role: 'system', content: getSystemPrompt(connLanguage) },
+    ];
+    const tools = [getToolDefinition()];
 
-    upstream.on('open', () => {
-      upstreamReady = true;
-      console.log(`[rt ${cid}] upstream OPEN — sending session.update + response.create`);
+    // Current TTS job — stored so barge-in can abort it.
+    let currentTts = null;
+    let closed = false;
 
-      // 1) Session config — persona, tool, audio format.
-      const sessionFrame = JSON.stringify({ type: 'session.update', session: buildSessionConfig({ voice: VOICE }) });
-      console.log(`[rt ${cid}] → azure session.update (${sessionFrame.length}B payload)`);
-      upstream.send(sessionFrame);
+    // Turn lock — prevent concurrent runAssistantTurn executions.
+    let turnRunning = false;
+    let turnQueued = false;
 
-      // 2) Kick off so the AI greets before any user audio arrives.
-      console.log(`[rt ${cid}] → azure response.create (open greeting)`);
-      upstream.send(JSON.stringify({ type: 'response.create' }));
+    // Debounce — accumulate STT fragments before triggering LLM.
+    const RECOGNIZE_DEBOUNCE_MS = 1500; // wait 1.5s of silence after last fragment
+    let pendingUtterance = '';
+    let debounceTimer = null;
 
-      if (pending.length) {
-        console.log(`[rt ${cid}] flushing ${pending.length} buffered browser frames`);
-        for (const msg of pending) upstream.send(msg);
-        pending.length = 0;
-      }
-    });
+    // ---- STT setup ----
+    let stt = createRecognizer(cid, { language: connLanguage });
+    let sttRebuilding = false;
 
-    // ---- Upstream → browser, with tool-call interception ----
-    upstream.on('message', async (data) => {
-      const raw = data.toString();
-      upstreamInCount++;
-
-      let msg;
-      try { msg = JSON.parse(raw); } catch { msg = null; }
-      const desc = describeEvent(raw, msg);
-
-      if (msg?.type === 'response.output_audio.delta' || msg?.type === 'response.audio.delta') audioOutCount++;
-
-      console.log(`[rt ${cid}] ← azure #${upstreamInCount} ${desc}`);
-
-      // Forward every frame to the browser unchanged.
-      if (client.readyState === WebSocket.OPEN) client.send(raw);
-
-      // --- Transcript capture (completed events only, no delta buffering) ---
-      if (msg?.type === 'conversation.item.input_audio_transcription.completed') {
-        await persistTurn('user', msg.transcript ?? '');
-      }
-      if (msg?.type === 'response.output_audio_transcript.done' || msg?.type === 'response.audio_transcript.done') {
-        await persistTurn('assistant', msg.transcript ?? '');
-      }
-
-      // --- Tool call interception ---
-      if (msg?.type === 'response.function_call_arguments.done') {
-        let args = {};
-        try { args = msg.arguments ? JSON.parse(msg.arguments) : {}; } catch (err) {
-          console.warn(`[rt ${cid}] could not parse tool args:`, err.message, msg.arguments);
-        }
-
-        console.log(`[rt ${cid}] TOOL CALL name=${msg.name} call_id=${msg.call_id} args=${JSON.stringify(args)}`);
-
-        const result = await handleToolCall({ name: msg.name, args, interviewId, questionSet });
-        console.log(`[rt ${cid}] TOOL RESULT → ${JSON.stringify(result)}`);
-
-        if (upstream.readyState === WebSocket.OPEN) {
-          const outputFrame = JSON.stringify({
-            type: 'conversation.item.create',
-            item: { type: 'function_call_output', call_id: msg.call_id, output: JSON.stringify(result) },
+    function wireRecognizerEvents(rec) {
+      // Partial recognition → optional live user text in transcript panel.
+      rec.recognizing = (_s, e) => {
+        if (closed) return;
+        const text = e.result.text;
+        if (text) {
+          send(client, {
+            type: 'conversation.item.input_audio_transcription.delta',
+            delta: text,
           });
-          console.log(`[rt ${cid}] → azure conversation.item.create function_call_output call_id=${msg.call_id}`);
-          upstream.send(outputFrame);
+        }
+      };
 
-          console.log(`[rt ${cid}] → azure response.create (continue after tool)`);
-          upstream.send(JSON.stringify({ type: 'response.create' }));
-        } else {
-          console.warn(`[rt ${cid}] upstream closed before tool output could be sent`);
+      // Final recognition → accumulate text, debounce before triggering LLM.
+      rec.recognized = (_s, e) => {
+        if (closed) return;
+        if (e.result.reason !== sdk.ResultReason.RecognizedSpeech) return;
+        const text = e.result.text;
+        if (!text || !text.trim()) return;
+
+        console.log(`[rt ${cid}] STT fragment: "${text.slice(0, 120)}"`);
+
+        // Barge-in: if TTS is playing, cancel it on the first fragment.
+        if (currentTts) {
+          console.log(`[rt ${cid}] barge-in — cancelling TTS`);
+          currentTts.abort = true;
+          currentTts = null;
+          send(client, { type: 'response.cancelled' });
+        }
+
+        // Accumulate fragment.
+        pendingUtterance += (pendingUtterance ? ' ' : '') + text;
+
+        // Reset debounce timer.
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          debounceTimer = null;
+          if (closed || !pendingUtterance.trim()) return;
+
+          const fullText = pendingUtterance;
+          pendingUtterance = '';
+
+          console.log(`[rt ${cid}] STT final (debounced): "${fullText.slice(0, 120)}"`);
+
+          send(client, {
+            type: 'conversation.item.input_audio_transcription.completed',
+            transcript: fullText,
+          });
+
+          persistTurn('user', fullText);
+          conversationHistory.push({ role: 'user', content: fullText });
+          runAssistantTurn();
+        }, RECOGNIZE_DEBOUNCE_MS);
+      };
+
+      rec.canceled = (_s, e) => {
+        if (e.reason !== sdk.CancellationReason.Error) return;
+        console.warn(`[rt ${cid}] STT canceled (error): ${e.errorDetails}`);
+        if (closed || sttRebuilding) return;
+        rebuildRecognizer();
+      };
+    }
+
+    function rebuildRecognizer() {
+      sttRebuilding = true;
+      console.log(`[rt ${cid}] rebuilding STT recognizer…`);
+      // Best-effort teardown of old recognizer.
+      try { stt.recognizer.close(); } catch (_) {}
+      try { stt.pushStream.close(); } catch (_) {}
+
+      stt = createRecognizer(cid, { language: connLanguage });
+      wireRecognizerEvents(stt.recognizer);
+      stt.recognizer.startContinuousRecognitionAsync(
+        () => {
+          sttRebuilding = false;
+          console.log(`[rt ${cid}] STT rebuilt and restarted`);
+        },
+        (err) => {
+          sttRebuilding = false;
+          console.error(`[rt ${cid}] STT rebuild start failed:`, err);
+        },
+      );
+    }
+
+    wireRecognizerEvents(stt.recognizer);
+
+    // Start continuous recognition.
+    stt.recognizer.startContinuousRecognitionAsync(
+      () => console.log(`[rt ${cid}] STT continuous recognition started`),
+      (err) => console.error(`[rt ${cid}] STT start failed:`, err),
+    );
+
+    // ---- LLM + tool loop ----
+    async function runAssistantTurn() {
+      if (turnRunning) {
+        console.log(`[rt ${cid}] turn already running — queuing`);
+        turnQueued = true;
+        return;
+      }
+      turnRunning = true;
+      turnQueued = false;
+
+      // Bumped from 8 — chained non-question items consume extra iterations.
+      const MAX_TOOL_ITERATIONS = 20;
+      // Track last item type from tool results so we can auto-continue
+      // after non-question items (they don't wait for user input).
+      let lastItemType = null;
+      let lastItemRequirement = null;
+      // When true, the next LLM call forces tool invocation.
+      let forceToolCall = false;
+
+      try {
+        for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+          if (closed) return;
+          console.log(`[rt ${cid}] LLM call #${i + 1} messages=${conversationHistory.length} forceToolCall=${forceToolCall}`);
+
+          const toolChoice = forceToolCall
+            ? { type: 'function', function: { name: 'get_next_interview_question' } }
+            : 'auto';
+          forceToolCall = false;
+
+          const json = await chatCompletion(conversationHistory, tools, toolChoice);
+          const choice = json.choices?.[0];
+          if (!choice) {
+            console.error(`[rt ${cid}] LLM returned no choices`);
+            return;
+          }
+
+          const msg = choice.message;
+
+          // Tool calls?
+          if (msg.tool_calls && msg.tool_calls.length > 0) {
+            // The LLM sometimes returns content alongside tool_calls
+            // (e.g. speaking a non-question item while calling the tool
+            // for the next one). Speak that content before processing
+            // the tool calls so it isn't silently dropped.
+            if (msg.content && msg.content.trim()) {
+              const inlineText = msg.content;
+              console.log(`[rt ${cid}] LLM inline content+tool_calls: "${inlineText.slice(0, 120)}"`);
+              await persistTurn('assistant', inlineText);
+              send(client, { type: 'response.audio_transcript.delta', delta: inlineText });
+              send(client, { type: 'response.audio_transcript.done', transcript: inlineText });
+              await synthesizeAndStream(inlineText);
+            }
+
+            // Append the assistant message (with tool_calls) to history.
+            conversationHistory.push(msg);
+
+            for (const tc of msg.tool_calls) {
+              let args = {};
+              try { args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {}; } catch (err) {
+                console.warn(`[rt ${cid}] could not parse tool args:`, err.message);
+              }
+              console.log(`[rt ${cid}] TOOL CALL name=${tc.function.name} id=${tc.id} args=${JSON.stringify(args)}`);
+
+              const result = await handleToolCall({
+                name: tc.function.name,
+                args,
+                interviewId,
+                questionSet,
+              });
+              console.log(`[rt ${cid}] TOOL RESULT → ${JSON.stringify(result)}`);
+
+              // Track the item type/requirement so we know what to do after TTS.
+              if (result.type) lastItemType = result.type;
+              if (result.hasOwnProperty('requirement')) lastItemRequirement = result.requirement || '';
+
+              conversationHistory.push({
+                role: 'tool',
+                tool_call_id: tc.id,
+                content: JSON.stringify(result),
+              });
+            }
+            // Loop — re-POST to LLM with the tool results.
+            continue;
+          }
+
+          // Final text response.
+          const text = msg.content ?? '';
+          console.log(`[rt ${cid}] LLM response (lastItemType=${lastItemType}): "${text.slice(0, 120)}"`);
+          conversationHistory.push({ role: 'assistant', content: text });
+          await persistTurn('assistant', text);
+
+          // Send transcript to client.
+          send(client, { type: 'response.audio_transcript.delta', delta: text });
+          send(client, { type: 'response.audio_transcript.done', transcript: text });
+
+          // TTS.
+          await synthesizeAndStream(text);
+
+          // Non-question items (intro, transition, closing) don't wait for
+          // user input. Auto-continue so the LLM calls the tool again for
+          // the next item.
+          if (lastItemType === 'non-question') {
+            console.log(`[rt ${cid}] non-question delivered — auto-continuing`);
+            lastItemType = null;
+            continue;
+          }
+
+          // For question items (qualitative/factual), always wait for the
+          // user to respond — even if requirement is empty (e.g. a greeting).
+          // Only force-continue for non-questions with empty requirement.
+          console.log(`[rt ${cid}] question delivered (type=${lastItemType}) — waiting for user`);
+          
+          return;
+        }
+        console.warn(`[rt ${cid}] tool loop hit max iterations (${MAX_TOOL_ITERATIONS})`);
+      } catch (err) {
+        console.error(`[rt ${cid}] runAssistantTurn error:`, err);
+        send(client, { type: 'error', error: { message: err.message } });
+      } finally {
+        turnRunning = false;
+        if (turnQueued && !closed) {
+          console.log(`[rt ${cid}] draining queued turn`);
+          runAssistantTurn();
         }
       }
-    });
+    }
 
-    upstream.on('close', (code, reason) => {
-      console.log(`[rt ${cid}] upstream CLOSE code=${code} reason="${reason?.toString() ?? ''}" — totals: upstreamIn=${upstreamInCount} audioOut=${audioOutCount} browserIn=${browserInCount}`);
-      if (client.readyState === WebSocket.OPEN) client.close();
-    });
-    upstream.on('error', (err) => {
-      console.error(`[rt ${cid}] upstream ERROR ${err.message}`);
-      if (client.readyState === WebSocket.OPEN) client.close(1011, 'upstream error');
-    });
+    // ---- TTS streaming ----
+    async function synthesizeAndStream(text) {
+      if (closed || !text.trim()) return;
 
-    // ---- Browser → upstream ----
+      const ttsJob = { abort: false };
+      currentTts = ttsJob;
+
+      const synthesizer = createSynthesizer({ voice: connVoice });
+      const CHUNK_BYTES = 12000; // ~250ms of 24kHz 16-bit mono
+      const cleanText = stripTags(text);
+      console.log(`[rt ${cid}] TTS plaintext (${cleanText.length} chars)`);
+
+      return new Promise((resolve) => {
+        synthesizer.speakTextAsync(
+          cleanText,
+          (result) => {
+            if (ttsJob.abort) {
+              console.log(`[rt ${cid}] TTS aborted (barge-in)`);
+              synthesizer.close();
+              resolve();
+              return;
+            }
+            if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
+              const audioData = result.audioData;
+              // Stream in chunks to the browser.
+              for (let offset = 0; offset < audioData.byteLength; offset += CHUNK_BYTES) {
+                if (ttsJob.abort || closed) break;
+                const end = Math.min(offset + CHUNK_BYTES, audioData.byteLength);
+                const chunk = new Uint8Array(audioData, offset, end - offset);
+                send(client, {
+                  type: 'response.audio.delta',
+                  delta: bufferToBase64(chunk),
+                });
+                audioOutCount++;
+              }
+              if (!ttsJob.abort) {
+                send(client, { type: 'response.done' });
+              }
+              console.log(`[rt ${cid}] TTS complete text="${text.slice(0, 60)}…" chunks=${audioOutCount}`);
+            } else {
+              console.error(`[rt ${cid}] TTS failed reason=${result.reason} errorDetails=${result.errorDetails}`);
+              send(client, { type: 'response.done' });
+            }
+            if (currentTts === ttsJob) currentTts = null;
+            synthesizer.close();
+            resolve();
+          },
+          (err) => {
+            console.error(`[rt ${cid}] TTS error:`, err);
+            if (currentTts === ttsJob) currentTts = null;
+            synthesizer.close();
+            resolve();
+          },
+        );
+      });
+    }
+
+    // ---- Browser → server ----
     client.on('message', (data) => {
       const msgStr = data.toString();
       browserInCount++;
 
       let parsed;
       try { parsed = JSON.parse(msgStr); } catch { parsed = null; }
-      const desc = describeEvent(msgStr, parsed);
 
-      // Audio-append frames are extremely frequent; log every 25th so the
-      // stream is visible but doesn't drown the other log lines.
-      if (parsed?.type === 'input_audio_buffer.append') {
+      if (parsed?.type === 'input_audio_buffer.append' && parsed.audio) {
         if (browserInCount === 1 || browserInCount % 25 === 0) {
-          console.log(`[rt ${cid}] → azure #${browserInCount} ${desc}`);
+          console.log(`[rt ${cid}] ← browser #${browserInCount} input_audio_buffer.append audio(${Math.round((parsed.audio.length || 0) * 0.75)}B)`);
+        }
+        // Decode base64 PCM16 and push to STT stream.
+        try {
+          const int16 = b64ToInt16(parsed.audio);
+          stt.pushStream.write(int16.buffer);
+        } catch (err) {
+          console.error(`[rt ${cid}] audio decode error:`, err.message);
         }
       } else {
-        console.log(`[rt ${cid}] → azure #${browserInCount} ${desc}`);
+        console.log(`[rt ${cid}] ← browser #${browserInCount} ${parsed?.type ?? 'unknown'}`);
       }
-
-      if (upstreamReady) upstream.send(msgStr);
-      else pending.push(msgStr);
     });
 
+    // ---- Opening greeting ----
+    // Anna speaks first, just like the old Realtime bridge.
+    console.log(`[rt ${cid}] triggering opening assistant turn`);
+    runAssistantTurn();
+
+    // ---- Cleanup on close ----
     client.on('close', (code, reason) => {
-      console.log(`[rt ${cid}] client CLOSE code=${code} reason="${reason?.toString() ?? ''}" — totals: browserIn=${browserInCount}`);
-      if (upstream.readyState <= WebSocket.OPEN) upstream.close();
+      closed = true;
+      console.log(`[rt ${cid}] client CLOSE code=${code} reason="${reason?.toString() ?? ''}" — totals: browserIn=${browserInCount} audioOut=${audioOutCount}`);
+      // Cancel pending debounce.
+      if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+      // Stop STT.
+      try { stt.recognizer.close(); } catch (_) {}
+      try { stt.pushStream.close(); } catch (_) {}
+      console.log(`[rt ${cid}] STT closed`);
+      // Abort any in-flight TTS.
+      if (currentTts) currentTts.abort = true;
     });
   });
 }
