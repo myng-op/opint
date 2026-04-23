@@ -1,6 +1,6 @@
 {
   "q1": {
-    "content": "Hello! My name is Anna, and I'm an AI assistant who will be conducting today's interview with you. Thank you so much for choosing to participate in our study! I'm just an AI, so please be very patient with me as sometimes I can be slow, but I'm fully attentive to you, I promise! This is a semi-structured interview. For completeness, I may ask a few questions that might seem repetitive along the way. This interview will cover your life experiences as well as your views on various social topics.",
+    "content": "Hello! My name is Anna, and I'm an AI assistant who will be conducting today's interview with you. Thank you so much for choosing to participate in our study! I'm just an AI, so please be very patient with me as sometimes I can be slow, but I'm fully attentive to you, I promise! This is a semi-structured interview. For completeness, I may ask a few questions that might seem repetitive along the way. This interview is a mock interview and will cover your life experiences as well as your views on various social topics.",
     "type": "non-question",
     "requirement": "Set a friendly, patient tone and establish the structure of the interview. Use a cheeky, engaging persona.",
     "condition": "",
@@ -11,12 +11,12 @@
     "type": "factual",
     "requirement": "Collect basic demographic information from the participant. Ask more questions if the participant's answer is incomplete (e.g. they only say their name).",
     "condition": "",
-    "max_sec": 10
+    "max_sec": 15
   },
   "q3": {
     "content": "How long have you been living in Finland?",
     "type": "factual",
-    "requirement": "Establish the duration of the participant's residency in Finland.",
+    "requirement": "Establish the duration of the participant's residency in Finland. Check for the inconsistency in the participant's answer (e.g. they say 5 years but later mention they moved here in 2018).",
     "condition": "",
     "max_sec": 5
   },
@@ -30,7 +30,7 @@
   "q5": {
     "content": "Can you tell me about a difficult time you had as a foreigner in this country?",
     "type": "qualitative",
-    "requirement": "Explore the challenges and personal struggles the participant has faced during their integration. Be empathetic and supportive.",
+    "requirement": "Explore the challenges and personal struggles the participant has faced during their integration. Be empathetic and supportive. Check for inconsistencies or contradictions in their narrative.",
     "condition": "",
     "max_sec": 120
   }

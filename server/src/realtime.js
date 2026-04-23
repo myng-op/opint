@@ -359,8 +359,6 @@ export function attachRealtimeProxy(httpServer) {
               const inlineText = msg.content;
               console.log(`[rt ${cid}] LLM inline content+tool_calls: "${inlineText.slice(0, 120)}"`);
               await persistTurn('assistant', inlineText);
-              send(client, { type: 'response.audio_transcript.delta', delta: inlineText });
-              send(client, { type: 'response.audio_transcript.done', transcript: inlineText });
               await synthesizeAndStream(inlineText);
             }
 
@@ -402,11 +400,7 @@ export function attachRealtimeProxy(httpServer) {
           conversationHistory.push({ role: 'assistant', content: text });
           await persistTurn('assistant', text);
 
-          // Send transcript to client.
-          send(client, { type: 'response.audio_transcript.delta', delta: text });
-          send(client, { type: 'response.audio_transcript.done', transcript: text });
-
-          // TTS.
+          // TTS + synchronized transcript (words drip with audio).
           await synthesizeAndStream(text);
 
           // Non-question items (intro, transition, closing) don't wait for
@@ -462,7 +456,16 @@ export function attachRealtimeProxy(httpServer) {
             }
             if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
               const audioData = result.audioData;
-              // Stream in chunks to the browser.
+              const totalChunks = Math.ceil(audioData.byteLength / CHUNK_BYTES);
+
+              // Split text into words and distribute across audio chunks
+              // so subtitles drip in sync with speech.
+              const words = text.split(/\s+/).filter(Boolean);
+              const wordsPerChunk = totalChunks > 0 ? words.length / totalChunks : words.length;
+              let wordsSent = 0;
+
+              // Stream audio chunks + interleaved transcript words.
+              let chunkIndex = 0;
               for (let offset = 0; offset < audioData.byteLength; offset += CHUNK_BYTES) {
                 if (ttsJob.abort || closed) break;
                 const end = Math.min(offset + CHUNK_BYTES, audioData.byteLength);
@@ -472,8 +475,35 @@ export function attachRealtimeProxy(httpServer) {
                   delta: bufferToBase64(chunk),
                 });
                 audioOutCount++;
+                chunkIndex++;
+
+                // Drip the next batch of words for this chunk.
+                const targetWords = Math.min(
+                  Math.round(wordsPerChunk * chunkIndex),
+                  words.length,
+                );
+                if (targetWords > wordsSent) {
+                  const batch = words.slice(wordsSent, targetWords).join(' ');
+                  const prefix = wordsSent === 0 ? '' : ' ';
+                  send(client, {
+                    type: 'response.audio_transcript.delta',
+                    delta: prefix + batch,
+                  });
+                  wordsSent = targetWords;
+                }
               }
+
+              // Flush any remaining words (rounding edge case).
+              if (wordsSent < words.length && !ttsJob.abort && !closed) {
+                const remaining = words.slice(wordsSent).join(' ');
+                send(client, {
+                  type: 'response.audio_transcript.delta',
+                  delta: ' ' + remaining,
+                });
+              }
+
               if (!ttsJob.abort) {
+                send(client, { type: 'response.audio_transcript.done', transcript: text });
                 send(client, { type: 'response.done' });
               }
               console.log(`[rt ${cid}] TTS complete text="${text.slice(0, 60)}…" chunks=${audioOutCount}`);
