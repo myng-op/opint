@@ -7,8 +7,9 @@ review.
 
 ## Stack
 
-- **Azure OpenAI Realtime (`gpt-realtime-1.5`)** — speech-in / speech-out model
-- **Node.js + Express + `ws`** — HTTP API and WebSocket proxy to Azure
+- **Azure AI Foundry Chat Completions** — LLM step (deployment via `AZURE_AI_DEPLOYMENT`)
+- **Azure Cognitive Services Speech** — streaming STT + Neural TTS (DragonHD voices for English/Chinese, standard Neural for other locales) via `microsoft-cognitiveservices-speech-sdk`
+- **Node.js + Express + `ws`** — HTTP API and WebSocket bridge between browser and the Azure services
 - **MongoDB + Mongoose** — question bank, interviews, transcripts
 - **React (Vite)** — single-surface interviewee UI
 - **Docker Compose** — local Mongo
@@ -24,9 +25,11 @@ opint/
 ├── interviews/               # seed JSON — one file per QuestionSet
 │   └── sample_interview.json
 ├── prompts/                  # human-authored planning docs
-│   ├── behaviour.md          # collaboration rules
-│   ├── plan.md               # project-level plan + phase roadmap
-│   └── PROMPTS.md            # log of influential prompts
+│   ├── behaviour.md          # collaboration rules (instruction hierarchy)
+│   ├── manifest.md           # current plan + project state + tech debt
+│   ├── PROMPTS.md            # log of influential prompts
+│   └── archive/              # historical phase changelogs
+│       └── logs.md
 ├── server/                   # Node backend
 │   └── src/
 │       ├── index.js          # http + ws entrypoint
@@ -40,7 +43,8 @@ opint/
 │       │   ├── prompts/      # markdown — edit + restart to tweak persona
 │       │   │   ├── persona.md     # Anna's voice, silence discipline, opening
 │       │   │   ├── mechanics.md   # tool usage, follow-ups, closing
-│       │   │   └── guardrails.md  # ethics, neutrality, de-escalation
+│       │   │   ├── guardrails.md  # ethics, neutrality, de-escalation
+│       │   │   └── speech.md      # natural-speech cues (filler, pauses, paralinguistics)
 │       │   └── tools.js      # get_next_interview_question handler
 │       ├── models/
 │       │   ├── QuestionSet.js
@@ -63,12 +67,26 @@ opint/
 1. Populate `.env` at the repo root. Required keys:
 
    ```
-   AZURE_ENDPOINT="https://<resource>.openai.azure.com/openai/v1/"
-   AZURE_API_KEY="<key>"
-   AZURE_REALTIME_MODEL="gpt-realtime-1.5"
-   AZURE_API_VERSION="2024-10-01-preview"
+   # LLM — Azure AI Foundry Chat Completions
+   AZURE_AI_ENDPOINT="https://<resource>.openai.azure.com/"
+   AZURE_AI_KEY="<key>"
+   AZURE_AI_DEPLOYMENT="<chat-completions-deployment-name>"
+
+   # STT + TTS — Azure Cognitive Services Speech
+   AZURE_SPEECH_KEY="<key>"
+   AZURE_SPEECH_REGION="<region>"          # e.g. swedencentral
+
    MONGO_URI="mongodb://localhost:27017/opint"
-   VITE_AZURE_REALTIME_VOICE="coral"
+   ```
+
+   Optional keys (sensible defaults applied if unset):
+
+   ```
+   AZURE_AI_API_VERSION                    # default "2024-10-21"
+   AZURE_SPEECH_ENDPOINT                   # only if overriding the regional endpoint
+   AZURE_STT_LANGUAGE                      # default "en-US" — overridden per-interview by the language picker
+   AZURE_TTS_VOICE                         # default "en-US-JennyMultilingualNeural"; recommended: "en-US-Ava:DragonHDLatestNeural"
+   PORT                                    # default 3001
    ```
 
 2. Install dependencies (root, server, client):

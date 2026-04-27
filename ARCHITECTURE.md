@@ -6,46 +6,75 @@ updated as each phase lands.
 ## High-level data flow
 
 ```
-┌─────────────┐   WS    ┌──────────────┐   WSS    ┌──────────────────┐
-│  React UI   │ ──────▶ │  Node proxy  │ ───────▶ │  Azure Realtime  │
-│ (browser)   │ ◀────── │  + REST API  │ ◀─────── │   gpt-realtime   │
-└─────────────┘         └──────┬───────┘          └──────────────────┘
-                               │
-                               ▼
-                        ┌──────────────┐
-                        │   MongoDB    │
-                        │ (interviews, │
-                        │  questions,  │
-                        │  transcripts)│
-                        └──────────────┘
+┌─────────────┐   WS    ┌──────────────┐   HTTPS    ┌──────────────────────────┐
+│  React UI   │ ──────▶ │  Node proxy  │ ─────────▶ │  Azure AI Foundry        │
+│ (browser)   │ ◀────── │  + REST API  │ ◀───────── │   (Chat Completions LLM) │
+└─────────────┘         └──┬───────┬───┘            └──────────────────────────┘
+                           │       │  WSS/HTTPS     ┌──────────────────────────┐
+                           │       └──────────────▶ │  Azure Speech            │
+                           │           ◀────────────│   (streaming STT + TTS)  │
+                           ▼                        └──────────────────────────┘
+                    ┌──────────────┐
+                    │   MongoDB    │
+                    │ (interviews, │
+                    │  questions,  │
+                    │  transcripts)│
+                    └──────────────┘
 ```
 
-- The browser never talks to Azure directly — it would leak the API key.
-- One WS frame from the browser = one frame to Azure (and vice versa), with
-  the server free to **inspect and mutate** frames (this is how tool calls
-  like `get_next_interview_question` will be resolved server-side in Phase 4).
-- REST endpoints on the same Node process handle CRUD for question sets and
-  interview records.
+- The browser never talks to Azure directly — it would leak API keys.
+- The browser↔Node WS carries audio in both directions (PCM16 24 kHz,
+  base64-chunked deltas). The frame contract was deliberately preserved
+  through the April 22 STT→LLM→TTS migration so the client did not need
+  to change.
+- The server orchestrates three Azure services per turn: incoming PCM
+  feeds the Speech SDK recognizer (STT); the recognized utterance feeds
+  Chat Completions (LLM); the LLM's text reply feeds the Speech SDK
+  synthesizer (TTS); the resulting PCM streams back to the browser.
+- REST endpoints on the same Node process handle CRUD for question sets,
+  interview lifecycle, and transcript reads.
 
 ## Why these libraries
 
-| Choice             | Why                                                                 |
-|--------------------|---------------------------------------------------------------------|
-| Express            | Smallest viable HTTP framework; no opinions to fight.               |
-| `ws`               | Standard Node WS lib, works both as server and upstream client.     |
-| Mongoose           | Schema validation + model methods; makes the data model explicit.   |
-| Vite               | Fast dev server, native ESM, simple WS proxy config.                |
-| React Router       | Single route today; a shell that can host more pages without a refactor. |
-| Docker Compose     | Disposable Mongo for dev; one command up/down, no host pollution.   |
+| Choice                                  | Why                                                                       |
+|-----------------------------------------|---------------------------------------------------------------------------|
+| Express                                 | Smallest viable HTTP framework; no opinions to fight.                     |
+| `ws`                                    | Standard Node WS lib for the browser↔server bridge.                       |
+| `microsoft-cognitiveservices-speech-sdk`| Streaming STT + TTS in one package; `PushAudioInputStream` lets us feed it the same PCM frames the browser sends. |
+| `fetch` (native)                        | LLM step is a single HTTPS call to Azure AI Foundry — no SDK needed.      |
+| Mongoose                                | Schema validation + model methods; makes the data model explicit.         |
+| Vite                                    | Fast dev server, native ESM, simple WS proxy config.                      |
+| React Router                            | Multi-route shell (`/`, `/review`, `/review/:id`).                        |
+| Docker Compose                          | Disposable Mongo for dev; one command up/down, no host pollution.         |
 
 ## Audio pipeline
 
-- Browser captures mic at 24 kHz mono via `AudioContext` (Azure's native rate).
-- Samples are converted Float32 → Int16 PCM → base64 and sent as
-  `input_audio_buffer.append` events.
-- Server VAD (Azure-side) decides when a turn ends; no push-to-talk button needed.
-- Assistant audio arrives as `response.output_audio.delta` chunks that are
-  scheduled back-to-back on a second `AudioContext` for gapless playback.
+- Browser captures mic at 24 kHz mono via `AudioContext`. Float32 → Int16 PCM
+  → base64, sent as `input_audio_buffer.append` events on the WS.
+- Server pushes incoming PCM into a Speech SDK `PushAudioInputStream` that
+  feeds a continuous `SpeechRecognizer` (STT). Endpointing is handled by the
+  recognizer itself, not by the browser.
+- The recognizer's `recognized` event fires on each silence gap. A 1.5 s
+  debounce (`RECOGNIZE_DEBOUNCE_MS`) accumulates fragments into a
+  `pendingUtterance` so a single sentence with mid-thought pauses doesn't
+  trigger multiple LLM turns.
+- After debounce, `runAssistantTurn()` calls Chat Completions (LLM) with
+  the system prompt + transcript history + the new utterance. The tool
+  loop iterates up to 20 times: the model can call
+  `get_next_interview_question`, the server resolves it against Mongo,
+  and the loop continues until the model emits text content.
+- LLM text (plaintext, possibly with paralinguistics like `[laughter]`,
+  `…`, em-dashes — DragonHD voices auto-detect emotion natively, so SSML
+  is no longer used) feeds the Speech SDK synthesizer (`speakTextAsync`,
+  `Raw24Khz16BitMonoPcm`).
+- TTS PCM streams back to the browser as `response.audio.delta` frames
+  on the same WS — same frame shape the browser already played from the
+  previous Realtime build, so the client's gapless `AudioContext`
+  scheduler works unchanged.
+- **Barge-in.** When the recognizer fires `recognized` while TTS is
+  speaking, the server aborts the active synthesizer and emits
+  `response.cancelled`; the client flushes its scheduled
+  `BufferSource` nodes so Anna stops mid-sentence.
 
 ## Data model
 
@@ -93,6 +122,8 @@ Interview {
   questionSetId: ObjectId      // ref → QuestionSet
   status: "pending" | "in_progress" | "completed"
   currentIndex: number         // index of the NEXT question to ask
+  language: string             // BCP-47 locale (e.g. "fi-FI") — drives STT + system-prompt directive
+  ttsVoice: string             // Azure voice name — drives the TTS synthesizer
   startedAt, endedAt
   createdAt, updatedAt
 }
@@ -105,16 +136,17 @@ Lifecycle:
 
 ### `TranscriptTurn` (implemented, Phase 5)
 
-One completed utterance tied to an `Interview`. We persist **only on
-completion** events — no delta buffering:
+One completed utterance tied to an `Interview`. We persist **only when an
+utterance is final** — no delta buffering:
 
-- user turn    → `conversation.item.input_audio_transcription.completed`
-- assistant turn → `response.output_audio_transcript.done`
-  (or the legacy `response.audio_transcript.done`)
+- user turn      → after the STT debounce window closes and the accumulated
+  `pendingUtterance` is consumed by `runAssistantTurn()`
+- assistant turn → after the LLM emits its final `content` for the turn,
+  before TTS streaming starts
 
 If the WS dies mid-turn, that half-turn is dropped. This keeps the DB clean of
-noise and means a stored transcript reflects what was actually finalised by
-whisper (user) and the model (assistant).
+noise and means a stored transcript reflects what was actually recognised
+(user) and finalised by the model (assistant).
 
 ```
 TranscriptTurn {
@@ -143,54 +175,84 @@ in order without a separate sort pass.
 | GET    | `/api/interviews/:id`         | Read Interview state                          |
 | GET    | `/api/interviews/:id/transcript` | Ordered list of completed turns             |
 
-## Realtime session lifecycle (Phase 3 + 4)
+## Realtime session lifecycle (post-migration)
 
 ```
- browser                       server                          Azure Realtime
+ browser                       server                       Azure (Speech + AI Foundry)
    │                              │                                 │
    │ POST /api/interviews ───────▶│                                 │
+   │   { questionSetId,           │                                 │
+   │     language, ttsVoice }     │                                 │
    │◀─────────── { _id } ─────────│                                 │
    │                              │                                 │
    │ WS open ?interviewId=<id> ──▶│ load Interview + QuestionSet    │
-   │                              │   open upstream WS ────────────▶│
+   │                              │ build system prompt             │
+   │                              │ create Speech recognizer (STT)  │
+   │                              │   for interview.language        │
+   │                              │ create Speech synthesizer (TTS) │
+   │                              │   for interview.ttsVoice        │
    │                              │                                 │
-   │                              │ session.update (persona+tool) ─▶│
-   │                              │ response.create ───────────────▶│
+   │                              │ runAssistantTurn() — opening    │
+   │                              │   LLM ─ Chat Completions ──────▶│
+   │                              │   ◀───────────────── tool_call ─│
+   │                              │   resolve tool against Mongo    │
+   │                              │   LLM (loop) ──────────────────▶│
+   │                              │   ◀──────── content (greeting) ─│
+   │                              │   TTS ─ speakTextAsync ────────▶│
+   │◀── response.audio.delta ─────│◀──────────── PCM frames ────────│
    │                              │                                 │
-   │◀── audio + transcripts ──────│◀── response.output_audio.delta ─│
+   │ input_audio_buffer.append ──▶│ push into recognizer's stream   │
+   │   (PCM16 24kHz)              │                                 │
+   │                              │ STT recognized event            │
+   │                              │   debounced 1.5 s →             │
+   │                              │   runAssistantTurn(utterance)   │
+   │                              │   LLM (loop, max 20 iter) ─────▶│
+   │                              │   ◀──── tool_calls / content ───│
+   │                              │   TTS chunks ──────────────────▶│
+   │◀── response.audio.delta ─────│                                 │
    │                              │                                 │
-   │                              │◀── response.function_call ──────│
-   │                              │   args.done { name, call_id }    │
-   │                              │                                 │
-   │                              │ resolve tool against Mongo       │
-   │                              │   (advance currentIndex)         │
-   │                              │                                 │
-   │                              │ conversation.item.create ──────▶│
-   │                              │   { function_call_output }       │
-   │                              │ response.create ───────────────▶│
-   │                              │                                 │
-   │ input_audio_buffer.append ──▶│ ───────────────────────────────▶│  (user answers)
+   │   (user starts speaking)     │ STT recognized while TTS active │
+   │                              │   → abort current synthesizer   │
+   │◀── response.cancelled ───────│                                 │
+   │   flush playback buffers     │                                 │
 ```
 
 Key properties:
 - **Session ownership is server-side.** System prompt, tool schema, audio
-  config — all authored in `server/src/realtime/session.js`. The browser
+  format — all authored in `server/src/realtime/session.js`. The browser
   cannot override persona or inject tools.
-- **Prompt is modular.** `session.js` concatenates three files from
+- **Prompt is modular.** `session.js` concatenates four files from
   `server/src/realtime/prompts/` at boot: `persona.md` (voice + silence +
-  opening), `mechanics.md` (tool usage, follow-ups, closing), `guardrails.md`
-  (ethics, neutrality, de-escalation). Edit a file, restart the server, the
-  new prompt takes effect on the next WS connection.
-- **VAD silence window is 5 s.** Matches Anna's low-arousal pacing —
-  Azure's server VAD waits 5000 ms of silence before ending a user turn.
-- **AI greets first.** After `session.update` the server sends
-  `response.create` with no user input, and the model emits its opening.
-- **Tool dispatch is server-side.** `response.function_call_arguments.done`
-  is intercepted in `realtime.js`; `tools.js` resolves the function against
-  Mongo and returns a plain object serialized into `function_call_output`.
-- **Questions are pulled, not pushed.** The AI decides when it's satisfied
-  with an answer and calls `get_next_interview_question` — we never push
+  opening), `mechanics.md` (tool usage, follow-ups, closing),
+  `guardrails.md` (ethics, neutrality, de-escalation), `speech.md`
+  (natural-speech cues — fillers, ellipses, em-dashes, paralinguistics
+  like `[laughter]` that DragonHD voices render natively). Edit a file,
+  restart the server, the new prompt takes effect on the next WS
+  connection.
+- **STT debounce is 1.5 s.** `RECOGNIZE_DEBOUNCE_MS` accumulates
+  fragmentary `recognized` events into a single utterance so a thoughtful
+  participant who pauses mid-sentence doesn't trigger multiple LLM turns.
+- **STT recognizer is rebuildable.** If the recognizer enters
+  `Disconnected`, `rebuildRecognizer()` creates a fresh SDK instance +
+  push stream rather than restarting the same one (the SDK's restart
+  path was unreliable in our testing).
+- **AI greets first.** `runAssistantTurn()` fires immediately on WS
+  connect with no user utterance, so Anna speaks the opening before
+  the participant says anything.
+- **Tool dispatch is server-side.** Chat Completions returns a
+  `tool_calls` array; the server runs each call against Mongo (advancing
+  `Interview.currentIndex`) and feeds the results back into the next
+  iteration of the LLM loop.
+- **`non-question` items auto-chain.** Items typed `non-question` (intro,
+  transition, closing) skip waiting for a user response — the loop
+  continues until a question-typed item is emitted.
+- **Questions are pulled, not pushed.** The model decides when it's
+  satisfied and calls `get_next_interview_question` — we never push
   question text into the conversation unilaterally.
+- **Per-interview language.** `Interview.language` (BCP-47) and
+  `Interview.ttsVoice` are set when the participant picks a language on
+  the client. `realtime.js` reads them at WS open and passes them to
+  STT, TTS, and the system-prompt language directive.
 
 ## Open questions / decisions deferred
 
