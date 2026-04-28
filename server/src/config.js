@@ -23,6 +23,13 @@ if (missing.length) {
   process.exit(1);
 }
 
+const useEnvAgent = process.env.USE_PY_AGENT === 'true';
+const pyAgentUrl = process.env.PY_AGENT_URL || 'http://localhost:8001';
+if (useEnvAgent && !pyAgentUrl) {
+  console.error('USE_PY_AGENT=true but PY_AGENT_URL is empty');
+  process.exit(1);
+}
+
 export const config = {
   port: Number(process.env.PORT) || 3001,
   llm: {
@@ -50,6 +57,13 @@ export const config = {
   mongo: {
     uri: process.env.MONGO_URI || 'mongodb://localhost:27017/opint',
   },
+  // Phase 11.6 — Python LangGraph sidecar cutover. When `useEnvAgent` is true
+  // realtime.js delegates the LLM+tool-loop step to the Py service instead of
+  // calling Azure Chat Completions directly.
+  pyAgent: {
+    useEnvAgent,
+    url: pyAgentUrl,
+  },
 };
 
 // One-liner dump at import time. Secrets are never printed — only their
@@ -65,4 +79,7 @@ console.log(
 console.log(
   `[config] stt.region=${config.stt.region} stt.language=${config.stt.language} ` +
     `stt.key=<${lenOf(config.stt.key)} chars> tts.voice=${config.tts.voice}`
+);
+console.log(
+  `[config] pyAgent.useEnvAgent=${config.pyAgent.useEnvAgent} pyAgent.url=${config.pyAgent.url}`
 );

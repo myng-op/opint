@@ -125,6 +125,33 @@ need to free the ports manually: `npm run kill-ports`.
 
 Stop Mongo when you're done: `npm run mongo:down`.
 
+## Running with the Python LangGraph sidecar (branch `py-langgraph-agent`)
+
+Experimental — replaces the Node-side LLM+tool-loop with a Python
+LangGraph agent (FastAPI sidecar at `:8001`). Phase 11 in
+`meta/manifest.md`.
+
+1. Bring up the agent service:
+
+   ```
+   docker compose up -d agent
+   ```
+
+2. Flip the flag in your `.env`:
+
+   ```
+   USE_PY_AGENT=true
+   PY_AGENT_URL=http://localhost:8001
+   ```
+
+3. Start the Node server + client as usual (`npm run dev`).
+
+When the flag is on, `realtime.js` routes the LLM+tool-loop to the Py
+agent. STT, TTS, barge-in, and transcript persistence stay in Node.
+If the agent service is unreachable, Node emits `response.error` on
+the WS — there is **no silent fallback** to the Node path. Set
+`USE_PY_AGENT=false` (or omit it) to revert.
+
 ## REST surface
 
 See `ARCHITECTURE.md` for the full table. Quick reference:

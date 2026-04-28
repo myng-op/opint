@@ -209,6 +209,10 @@ export function attachRealtimeProxy(httpServer) {
     // Turn lock — prevent concurrent runAssistantTurn executions.
     let turnRunning = false;
     let turnQueued = false;
+    // Py-agent path is stateless on the Node side (Py owns history via
+    // its own checkpointer), so when a turn is queued we must remember
+    // the queued user utterance text. Null means "opening" → POST /open.
+    let queuedUserText = null;
 
     // Debounce — accumulate STT fragments before triggering LLM.
     const RECOGNIZE_DEBOUNCE_MS = 1500; // wait 1.5s of silence after last fragment
@@ -269,8 +273,14 @@ export function attachRealtimeProxy(httpServer) {
           });
 
           persistTurn('user', fullText);
-          conversationHistory.push({ role: 'user', content: fullText });
-          runAssistantTurn();
+          if (config.pyAgent.useEnvAgent) {
+            // Py owns conversation history via its checkpointer; don't
+            // duplicate locally — pass the user text into the turn.
+            runAssistantTurn(fullText);
+          } else {
+            conversationHistory.push({ role: 'user', content: fullText });
+            runAssistantTurn();
+          }
         }, RECOGNIZE_DEBOUNCE_MS);
       };
 
@@ -311,15 +321,73 @@ export function attachRealtimeProxy(httpServer) {
       (err) => console.error(`[rt ${cid}] STT start failed:`, err),
     );
 
+    // ---- Py-agent delegation (USE_PY_AGENT=true) ----
+    // Replaces the Node chatCompletion + tool loop with a single buffered
+    // POST to the Python LangGraph sidecar. Py owns conversation state via
+    // its Mongo checkpointer; Node keeps STT, TTS, debounce, barge-in, and
+    // transcript persistence (all unchanged). On Py failure we surface
+    // response.error to the WS — no silent fallback to the Node path.
+    async function runPyAgentTurn(userText) {
+      const isOpen = userText === null || userText === undefined;
+      const endpoint = isOpen ? '/open' : '/turn';
+      const url = `${config.pyAgent.url}${endpoint}`;
+      const body = isOpen ? { interviewId } : { interviewId, userText };
+      console.log(`[rt ${cid}] [py-agent] POST ${url} (${isOpen ? 'open' : 'turn'})`);
+      const started = Date.now();
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const elapsed = Date.now() - started;
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`py-agent ${res.status} (${elapsed}ms): ${text.slice(0, 300)}`);
+      }
+      const json = await res.json();
+      const assistantText = (json.assistantText ?? '').trim();
+      console.log(`[rt ${cid}] [py-agent] ← ${res.status} (${elapsed}ms) text="${assistantText.slice(0, 80)}…"`);
+      if (!assistantText) {
+        console.warn(`[rt ${cid}] [py-agent] empty assistantText — nothing to speak`);
+        return;
+      }
+      await persistTurn('assistant', assistantText);
+      await synthesizeAndStream(assistantText);
+    }
+
     // ---- LLM + tool loop ----
-    async function runAssistantTurn() {
+    async function runAssistantTurn(userText = null) {
       if (turnRunning) {
         console.log(`[rt ${cid}] turn already running — queuing`);
         turnQueued = true;
+        // Remember the most recent queued utterance for Py path replay;
+        // the Node path reads from conversationHistory so it doesn't care.
+        queuedUserText = userText;
         return;
       }
       turnRunning = true;
       turnQueued = false;
+
+      // Py-agent path: defer entirely to the sidecar. Skip the local LLM
+      // loop, tool dispatch, and conversationHistory bookkeeping.
+      if (config.pyAgent.useEnvAgent) {
+        try {
+          await runPyAgentTurn(userText);
+        } catch (err) {
+          console.error(`[rt ${cid}] [py-agent] ERROR:`, err.message);
+          send(client, { type: 'response.error', error: { message: err.message } });
+        } finally {
+          turnRunning = false;
+          if (turnQueued && !closed) {
+            const next = queuedUserText;
+            queuedUserText = null;
+            console.log(`[rt ${cid}] draining queued turn (py-agent)`);
+            runAssistantTurn(next);
+          }
+        }
+        return;
+      }
 
       // Bumped from 8 — chained non-question items consume extra iterations.
       const MAX_TOOL_ITERATIONS = 20;

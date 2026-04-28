@@ -301,6 +301,18 @@ interview without rebuilds. Errors:
 - `422` — malformed body (Pydantic).
 - `502` — graph invocation raised, or final AIMessage was empty.
 
+**Node cutover (Phase 11.6).** `server/src/realtime.js`'s
+`runAssistantTurn` now takes an optional `userText` arg. When
+`config.pyAgent.useEnvAgent` is true (env `USE_PY_AGENT=true`), the
+function defers to a single buffered POST to the Py sidecar:
+`POST /open` if `userText === null` (opening greeting), `POST /turn`
+otherwise. The browser audio-frame contract, the STT debounce, the TTS
+synth, the barge-in via `currentTts.abort`, and `persistTurn` are all
+unchanged — only the LLM+tool-loop block is replaced. On Py failure
+(network, 5xx, timeout) Node emits `response.error` on the WS and logs
+loud; **no silent fallback** to the Node Chat Completions path. With
+the flag off, the original tool-loop runs unchanged.
+
 Force-tool-call mechanic (mirrors `realtime.js:331`): when the most
 recent `ToolMessage` JSON content has `type == 'non-question'`, the next
 agent invocation binds the LLM with `tool_choice` forcing
