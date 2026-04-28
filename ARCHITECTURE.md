@@ -274,6 +274,20 @@ keys), same state-mutation semantics on the `interviews` collection
 flag is on, **Python owns these writes**; Node REST routes still own
 interview *creation* and `/end`.
 
+**Agent graph (Phase 11.4).** ReAct skeleton — single `agent` node + a
+`ToolNode` + the standard conditional edge (route to `tools` if AIMessage
+carries tool_calls, else END). State is messages-only
+(`Annotated[list, add_messages]`); per-interview state like `currentIndex`
+or `last_item_type` is never stored in the graph state — re-derived from
+the last `ToolMessage` on each agent invocation.
+
+Force-tool-call mechanic (mirrors `realtime.js:331`): when the most
+recent `ToolMessage` JSON content has `type == 'non-question'`, the next
+agent invocation binds the LLM with `tool_choice` forcing
+`get_next_interview_question`. Without this the model drifts on
+non-question items (intro, transitions, closing) instead of immediately
+calling the tool to advance.
+
 See `meta/manifest.md` Phase 11 and `~/.claude/plans/crystalline-sauteeing-treehouse.md`
 for the phased plan and DoD.
 
