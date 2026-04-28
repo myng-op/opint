@@ -152,6 +152,18 @@ If the agent service is unreachable, Node emits `response.error` on
 the WS — there is **no silent fallback** to the Node path. Set
 `USE_PY_AGENT=false` (or omit it) to revert.
 
+Optional LangSmith tracing — set in `.env` and rebuild the agent
+container:
+
+```
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=ls__...
+LANGSMITH_PROJECT=opint
+```
+
+Bench (DoD gate 3, manual): `BENCH_LIVE=1 INTERVIEW_ID=<oid>
+uv run --directory agent python scripts/bench.py`.
+
 ## REST surface
 
 See `ARCHITECTURE.md` for the full table. Quick reference:

@@ -70,7 +70,13 @@ checkpointer. Secondary win: LangSmith tracing on Anna's persona.
 - 11.4 ReAct graph (agent + tools nodes, messages-only state). **Done.**
 - 11.5 FastAPI `/open` + `/turn` endpoints. **Done.**
 - 11.6 Node-side cutover behind `USE_PY_AGENT`, fail-loud on Py down. **Done (code); manual smoke pending.**
-- 11.7 DoD verification (parity / resume / latency) + LangSmith.
+- 11.7 DoD verification (parity / resume / latency) + LangSmith. **Done (code); user manual steps remain.**
+
+DoD-gate status (Phase 11.7):
+- Gate 2 (resume): regression-locked by `test_resume_preserves_state_and_does_not_replay_questions` — currentIndex + checkpointer state preserved across simulated drop, Anna doesn't replay q1.
+- Gate 1 (parity): structural baseline-capture script at `agent/scripts/dump_baseline.py`. **User action**: run a Node-path interview with `USE_PY_AGENT=false`, then run the dumper to write `agent/tests/fixtures/sample_baseline.json`. Py-path parity assertion against that fixture is a follow-up.
+- Gate 3 (latency): `agent/scripts/bench.py` gated by `BENCH_LIVE=1`. **User action**: run on Node + Py paths, compare p95.
+- LangSmith: `configure_langsmith` wired at FastAPI startup; service still boots without creds. **User action**: set `LANGSMITH_TRACING=true` + key, eyeball the LangSmith dashboard for traces.
 
 DoD gates: parity (turn count + role sequence vs captured Node baseline),
 resume (WS drop → reconnect → no repeated question), latency p95 ≤ 1.5×

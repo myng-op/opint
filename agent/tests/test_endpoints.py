@@ -233,3 +233,92 @@ def test_open_invokes_real_tool_and_advances_interview(inserted_setup, endpoint_
     interview = endpoint_db.interviews.find_one({"_id": ObjectId(interview_id)})
     assert interview["status"] == "in_progress"
     assert interview["currentIndex"] == 1
+
+
+# ─────── Phase 11.7 — Resume DoD verification ───────
+
+
+def test_resume_preserves_state_and_does_not_replay_questions(
+    inserted_setup, endpoint_db
+):
+    """DoD gate 2: a simulated WS drop mid-interview, followed by a fresh
+    /open with the same interviewId, must NOT regress `currentIndex` and
+    must NOT make Anna re-greet or re-ask q1. Locks the wiring of
+    checkpoint inspection in /open + the InMemorySaver/MongoDBSaver
+    parity for thread_id = interviewId."""
+    from agent.main import build_app_graph
+
+    _db, interview_id = inserted_setup
+
+    scripted = [
+        # /open #1 — fresh thread: tool_call fetches q1, then speak it.
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "get_next_interview_question", "args": {}, "id": "c1"}],
+        ),
+        AIMessage(content="Tell me about your day."),
+        # /turn #1 — user answered q1 → tool_call fetches q2, speak it.
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "get_next_interview_question", "args": {}, "id": "c2"}],
+        ),
+        AIMessage(content="What is your name?"),
+        # /open #2 — simulated drop+reconnect: just acknowledge resume,
+        # NO tool call (so currentIndex must stay at 2).
+        AIMessage(content="Welcome back. Where were we?"),
+        # /turn #2 — user answered q2 after resume → fetch q3, speak it.
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "get_next_interview_question", "args": {}, "id": "c3"}],
+        ),
+        AIMessage(content="Thanks for sharing."),
+    ]
+    llm = FakeChatWithTools(messages=iter(scripted))
+    graph = build_app_graph(llm=llm, checkpointer=InMemorySaver())
+
+    app.dependency_overrides[get_db_dep] = lambda: endpoint_db
+    app.dependency_overrides[get_graph_dep] = lambda: graph
+    try:
+        client = TestClient(app)
+
+        r1 = client.post("/open", json={"interviewId": interview_id})
+        assert r1.json()["assistantText"] == "Tell me about your day."
+
+        r2 = client.post(
+            "/turn", json={"interviewId": interview_id, "userText": "I'm well."}
+        )
+        assert r2.json()["assistantText"] == "What is your name?"
+
+        idx_pre_drop = endpoint_db.interviews.find_one(
+            {"_id": ObjectId(interview_id)}
+        )["currentIndex"]
+        assert idx_pre_drop == 2
+
+        # Simulated WS drop — no actual disconnect, but the next /open
+        # must take the resume branch (existing checkpoint state).
+        r3 = client.post("/open", json={"interviewId": interview_id})
+        assert r3.status_code == 200
+        # Anna does NOT replay the greeting from r1.
+        assert r3.json()["assistantText"] != "Tell me about your day."
+        assert r3.json()["assistantText"] == "Welcome back. Where were we?"
+
+        # State preserved across the simulated drop.
+        idx_after_resume = endpoint_db.interviews.find_one(
+            {"_id": ObjectId(interview_id)}
+        )["currentIndex"]
+        assert idx_after_resume == 2, (
+            f"currentIndex regressed: was 2, now {idx_after_resume}"
+        )
+
+        # Continue the interview after resume — advances to q3.
+        r4 = client.post(
+            "/turn", json={"interviewId": interview_id, "userText": "Bob"}
+        )
+        assert r4.json()["assistantText"] == "Thanks for sharing."
+
+        idx_final = endpoint_db.interviews.find_one(
+            {"_id": ObjectId(interview_id)}
+        )["currentIndex"]
+        assert idx_final == 3
+    finally:
+        app.dependency_overrides.clear()

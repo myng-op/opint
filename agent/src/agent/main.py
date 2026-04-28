@@ -12,9 +12,14 @@ from agent.checkpointer import get_checkpointer
 from agent.config import get_settings
 from agent.db import get_db
 from agent.graph import build_graph
+from agent.langsmith_setup import configure_langsmith
 from agent.llm import get_llm
 from agent.sessions import system_message_for
 from agent.tools import get_next_interview_question as _gnq_impl
+
+# Wire LangSmith tracing at import time (Phase 11.7). No-op if the user
+# didn't opt in; never blocks boot if creds are missing.
+configure_langsmith(get_settings())
 
 app = FastAPI(title="opint-agent")
 

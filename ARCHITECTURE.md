@@ -313,6 +313,17 @@ unchanged — only the LLM+tool-loop block is replaced. On Py failure
 loud; **no silent fallback** to the Node Chat Completions path. With
 the flag off, the original tool-loop runs unchanged.
 
+**Tracing (Phase 11.7).** `agent/src/agent/langsmith_setup.py` reads
+`LANGSMITH_TRACING` / `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT` at
+FastAPI import time. When the user opts in, those vars are populated
+in `os.environ` and LangChain auto-traces every graph step. The
+service must boot + serve without LangSmith creds — tracing is purely
+opt-in, not load-bearing. Helper scripts:
+`agent/scripts/dump_baseline.py` captures a Node-path transcript as
+the parity baseline (DoD gate 1); `agent/scripts/bench.py` measures
+per-turn latency on the Py path (DoD gate 3). Both are user-driven —
+not part of CI.
+
 Force-tool-call mechanic (mirrors `realtime.js:331`): when the most
 recent `ToolMessage` JSON content has `type == 'non-question'`, the next
 agent invocation binds the LLM with `tool_choice` forcing
