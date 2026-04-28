@@ -68,7 +68,7 @@ checkpointer. Secondary win: LangSmith tracing on Anna's persona.
 - 11.2 Mongo client + bit-exact `get_next_interview_question` parity in Py. **Done.**
 - 11.3 `MongoDBSaver` wired, `thread_id = interviewId`. **Done.**
 - 11.4 ReAct graph (agent + tools nodes, messages-only state). **Done.**
-- 11.5 FastAPI `/open` + `/turn` endpoints.
+- 11.5 FastAPI `/open` + `/turn` endpoints. **Done.**
 - 11.6 Node-side cutover behind `USE_PY_AGENT`, fail-loud on Py down.
 - 11.7 DoD verification (parity / resume / latency) + LangSmith.
 

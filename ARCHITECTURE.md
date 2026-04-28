@@ -281,6 +281,26 @@ carries tool_calls, else END). State is messages-only
 or `last_item_type` is never stored in the graph state — re-derived from
 the last `ToolMessage` on each agent invocation.
 
+**HTTP contract (Phase 11.5).**
+
+| Method | Path       | Body                                | Returns                   |
+|--------|------------|-------------------------------------|---------------------------|
+| GET    | `/healthz` | —                                   | `{ok, port}`              |
+| POST   | `/open`    | `{interviewId}`                     | `{assistantText}`         |
+| POST   | `/turn`    | `{interviewId, userText}`           | `{assistantText}`         |
+
+`/open` inspects the checkpointed graph state via `get_state`. Empty →
+prepend `SystemMessage` from `prompts/anna/` + seed `HumanMessage("begin")`.
+Existing → resume nudge, no re-greet (asserts SystemMessage isn't
+duplicated). The `get_next_interview_question` tool reads `agent_db`,
+`agent_interview_id`, and `agent_question_set` from the per-invoke
+`RunnableConfig.configurable`, so the same compiled graph serves every
+interview without rebuilds. Errors:
+
+- `404` — interview or question set not found in Mongo.
+- `422` — malformed body (Pydantic).
+- `502` — graph invocation raised, or final AIMessage was empty.
+
 Force-tool-call mechanic (mirrors `realtime.js:331`): when the most
 recent `ToolMessage` JSON content has `type == 'non-question'`, the next
 agent invocation binds the LLM with `tool_choice` forcing
