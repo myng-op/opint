@@ -66,7 +66,7 @@ checkpointer. Secondary win: LangSmith tracing on Anna's persona.
 - 11.0 Branch + `agent/` skeleton (uv, FastAPI `/healthz`, dockerised). **Done.**
 - 11.1 Move Anna persona to `prompts/anna/` at repo root, dual reader (Node + Py). **Done.**
 - 11.2 Mongo client + bit-exact `get_next_interview_question` parity in Py. **Done.**
-- 11.3 `MongoDBSaver` wired, `thread_id = interviewId`.
+- 11.3 `MongoDBSaver` wired, `thread_id = interviewId`. **Done.**
 - 11.4 ReAct graph (agent + tools nodes, messages-only state).
 - 11.5 FastAPI `/open` + `/turn` endpoints.
 - 11.6 Node-side cutover behind `USE_PY_AGENT`, fail-loud on Py down.
