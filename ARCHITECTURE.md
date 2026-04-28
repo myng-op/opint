@@ -222,13 +222,14 @@ Key properties:
   format — all authored in `server/src/realtime/session.js`. The browser
   cannot override persona or inject tools.
 - **Prompt is modular.** `session.js` concatenates four files from
-  `server/src/realtime/prompts/` at boot: `persona.md` (voice + silence +
+  `prompts/anna/` (repo root) at boot: `persona.md` (voice + silence +
   opening), `mechanics.md` (tool usage, follow-ups, closing),
   `guardrails.md` (ethics, neutrality, de-escalation), `speech.md`
   (natural-speech cues — fillers, ellipses, em-dashes, paralinguistics
   like `[laughter]` that DragonHD voices render natively). Edit a file,
   restart the server, the new prompt takes effect on the next WS
-  connection.
+  connection. The Python LangGraph sidecar reads the same four files
+  from the same location, so persona edits propagate to both paths.
 - **STT debounce is 1.5 s.** `RECOGNIZE_DEBOUNCE_MS` accumulates
   fragmentary `recognized` events into a single utterance so a thoughtful
   participant who pauses mid-sentence doesn't trigger multiple LLM turns.

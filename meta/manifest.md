@@ -64,7 +64,7 @@ checkpointer. Secondary win: LangSmith tracing on Anna's persona.
 `POST /open` + `POST /turn`. Plan in `~/.claude/plans/crystalline-sauteeing-treehouse.md`.
 
 - 11.0 Branch + `agent/` skeleton (uv, FastAPI `/healthz`, dockerised). **Done.**
-- 11.1 Move Anna persona to `prompts/anna/` at repo root, dual reader (Node + Py).
+- 11.1 Move Anna persona to `prompts/anna/` at repo root, dual reader (Node + Py). **Done.**
 - 11.2 Mongo client + bit-exact `get_next_interview_question` parity in Py.
 - 11.3 `MongoDBSaver` wired, `thread_id = interviewId`.
 - 11.4 ReAct graph (agent + tools nodes, messages-only state).
@@ -90,8 +90,9 @@ collections: `QuestionSet` (seeded from `interviews/*.json`), `Interview`
 (lifecycle: pending → in_progress → completed, with `currentIndex` state
 machine), `TranscriptTurn` (per-utterance, persisted on completion events
 only — half-turns dropped if the WS dies). Anna's persona is assembled at
-boot from four markdown files in `server/src/realtime/prompts/`
-(persona, mechanics, guardrails, speech). Per-interview language selection
+boot from four markdown files in `prompts/anna/`
+(persona, speech, mechanics, guardrails) — same source-of-truth read by
+both the Node path and the Python LangGraph sidecar. Per-interview language selection
 covers seven locales (English, Finnish, Swedish, Chinese, Arabic, Somali,
 Vietnamese) and routes both STT locale and TTS voice. UI: gradient orb
 avatar with idle drift + speaking pulse, hide/show transcript, plus an
@@ -101,15 +102,15 @@ unlinked `/review` surface for replaying past interviews.
 `config.js` (env validation, fail-fast at boot), `realtime.js` (the
 STT→LLM→TTS pipeline + tool loop + barge-in), `realtime/session.js`
 (system-prompt assembly + tool schema), `realtime/tools.js`
-(`get_next_interview_question` handler), `realtime/prompts/*.md` (Anna's
-voice — now tracked, was silently gitignored before this cleanup),
+(`get_next_interview_question` handler),
 `models/{QuestionSet,Interview,TranscriptTurn}.js`,
 `routes/{questionSets,interviews}.js`, `seed.js`, `logging.js`. Frontend
 in `client/src/`: `routes/{Interview,Review,ReviewDetail}.jsx`, shared
 `theme.js`, `components/`. Repo-root: `docker-compose.yml` (Mongo),
 `interviews/*.json` (seed data), `icons/` (SVGs — use these, do not
 author inline), `meta/` (this file + `behaviour.md` + `archive/` — dev/process docs),
-`prompts/anna/` (Anna runtime persona — populated in Phase 11.1).
+`prompts/anna/` (Anna runtime persona — read by both Node and the Py
+LangGraph sidecar).
 
 **Where we are.** Demo-ready end-to-end. The pipeline is stable after the
 April 22 bugfix batch (silent-TTS / double-response / STT-disconnect

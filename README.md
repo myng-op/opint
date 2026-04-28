@@ -24,6 +24,12 @@ opint/
 ├── package.json              # root orchestration scripts
 ├── interviews/               # seed JSON — one file per QuestionSet
 │   └── sample_interview.json
+├── prompts/                  # app runtime prompts (LLM-facing assets)
+│   └── anna/                 # Anna persona — read by Node + Py agent
+│       ├── persona.md            # voice, silence discipline, opening
+│       ├── speech.md             # natural-speech cues, paralinguistics
+│       ├── mechanics.md          # tool usage, follow-ups, closing
+│       └── guardrails.md         # ethics, neutrality, de-escalation
 ├── meta/                     # dev/process docs (collaboration, planning)
 │   ├── behaviour.md          # collaboration rules (instruction hierarchy)
 │   ├── manifest.md           # current plan + project state + tech debt
@@ -39,12 +45,7 @@ opint/
 │       ├── logging.js        # compact formatter for realtime-WS events
 │       ├── realtime.js       # browser <-> Azure WS bridge, tool dispatch
 │       ├── realtime/
-│       │   ├── session.js    # tool schema + audio config; loads prompt files
-│       │   ├── prompts/      # markdown — edit + restart to tweak persona
-│       │   │   ├── persona.md     # Anna's voice, silence discipline, opening
-│       │   │   ├── mechanics.md   # tool usage, follow-ups, closing
-│       │   │   ├── guardrails.md  # ethics, neutrality, de-escalation
-│       │   │   └── speech.md      # natural-speech cues (filler, pauses, paralinguistics)
+│       │   ├── session.js    # tool schema; loads ../../../prompts/anna/*.md
 │       │   └── tools.js      # get_next_interview_question handler
 │       ├── models/
 │       │   ├── QuestionSet.js

@@ -1,6 +1,7 @@
 // Assembles the interviewer persona prompt and tool definition used by the
 // STT→LLM→TTS pipeline. The persona is split across markdown files under
-// `./prompts/` and concatenated at server start.
+// `prompts/anna/` (repo root) and concatenated at server start.
+// Same source-of-truth as the Python LangGraph sidecar (Phase 11.1).
 //
 // Exports:
 //   getSystemPrompt()   — full system prompt string
@@ -11,7 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROMPTS_DIR = path.join(__dirname, 'prompts');
+const PROMPTS_DIR = path.join(__dirname, '..', '..', '..', 'prompts', 'anna');
 
 function loadPrompt(name) {
   const file = path.join(PROMPTS_DIR, `${name}.md`);

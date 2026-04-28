@@ -4,7 +4,9 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-REPO_ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT_ENV = REPO_ROOT / ".env"
+DEFAULT_PROMPTS_DIR = REPO_ROOT / "prompts" / "anna"
 
 
 class Settings(BaseSettings):
@@ -23,6 +25,7 @@ class Settings(BaseSettings):
     mongo_db: str = Field(default="opint", alias="MONGO_DB")
 
     py_agent_port: int = Field(default=8001, alias="PY_AGENT_PORT")
+    prompts_dir: str = Field(default=str(DEFAULT_PROMPTS_DIR), alias="PROMPTS_DIR")
 
     langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
     langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY")
