@@ -53,6 +53,29 @@ Docker, no DB mocks. First targets: `realtime/tools.js` dispatch,
 `session.js` language directive, `realtime.js` debounce + barge-in, the
 question-set REST routes.
 
+### Phase 11 — Python LangGraph agent sidecar (experimental, branch only)
+
+Lives on branch `py-langgraph-agent`, ring-fenced behind `USE_PY_AGENT=true`.
+Goal: prove the plumbing for (a) a graph-shaped agent (ready for branching
+when `Question.condition` lands) and (b) durable resumable state via a Mongo
+checkpointer. Secondary win: LangSmith tracing on Anna's persona.
+"Fat Py" split — Python owns graph + tool dispatch + Mongo writes (raw
+`pymongo`); Node keeps STT/TTS/WS/REST. Wire = HTTP REST, buffered:
+`POST /open` + `POST /turn`. Plan in `~/.claude/plans/crystalline-sauteeing-treehouse.md`.
+
+- 11.0 Branch + `agent/` skeleton (uv, FastAPI `/healthz`, dockerised). **Done.**
+- 11.1 Move `prompts/anna/` to repo root, dual reader (Node + Py).
+- 11.2 Mongo client + bit-exact `get_next_interview_question` parity in Py.
+- 11.3 `MongoDBSaver` wired, `thread_id = interviewId`.
+- 11.4 ReAct graph (agent + tools nodes, messages-only state).
+- 11.5 FastAPI `/open` + `/turn` endpoints.
+- 11.6 Node-side cutover behind `USE_PY_AGENT`, fail-loud on Py down.
+- 11.7 DoD verification (parity / resume / latency) + LangSmith.
+
+DoD gates: parity (turn count + role sequence vs captured Node baseline),
+resume (WS drop → reconnect → no repeated question), latency p95 ≤ 1.5×
+Node. v2 branching pilot is **out of scope** for this branch.
+
 ## Project State
 
 **Built features.** Voice interview pipeline running on three Azure services:

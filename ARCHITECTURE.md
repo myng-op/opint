@@ -254,6 +254,19 @@ Key properties:
   the client. `realtime.js` reads them at WS open and passes them to
   STT, TTS, and the system-prompt language directive.
 
+## Experimental: Python LangGraph agent sidecar
+
+Lives on branch `py-langgraph-agent` only. A FastAPI service in `agent/`
+(uv-managed, Python 3.12) that — when `USE_PY_AGENT=true` — replaces the
+Node-side LLM call + tool loop in `realtime.js`. Owns the LangGraph state
+machine, tool dispatch, and Mongo writes for interview-state mutations.
+Node keeps STT, TTS, WS, REST, and transcript persistence. Wire is HTTP
+REST, buffered (no token streaming): `POST /open` on WS connect,
+`POST /turn` per debounce flush. Checkpointer = `MongoDBSaver` against
+the same Mongo, collection `agent_checkpoints`, `thread_id = interviewId`.
+See `prompts/manifest.md` Phase 11 and `~/.claude/plans/crystalline-sauteeing-treehouse.md`
+for the phased plan and DoD.
+
 ## Open questions / decisions deferred
 
 - **Auth** — none in the demo. Revisit if the interviewee surface is ever exposed to untrusted users.

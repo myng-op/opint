@@ -3,3 +3,10 @@ client/node_modules
 client/dist
 .env
 .DS_Store
+
+# Python (agent/)
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache

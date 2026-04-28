@@ -8,5 +8,22 @@ services:
     volumes:
       - opint-mongo-data:/data/db
 
+  agent:
+    build:
+      context: ./agent
+    container_name: opint-agent
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    ports:
+      - "8001:8001"
+    env_file:
+      - ./.env
+    environment:
+      MONGO_URI: mongodb://mongo:27017/opint
+      PY_AGENT_PORT: "8001"
+    volumes:
+      - ./prompts:/app/prompts:ro
+
 volumes:
   opint-mongo-data:
