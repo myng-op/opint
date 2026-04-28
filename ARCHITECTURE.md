@@ -265,6 +265,15 @@ Node keeps STT, TTS, WS, REST, and transcript persistence. Wire is HTTP
 REST, buffered (no token streaming): `POST /open` on WS connect,
 `POST /turn` per debounce flush. Checkpointer = `MongoDBSaver` against
 the same Mongo, collection `agent_checkpoints`, `thread_id = interviewId`.
+
+**Tool parity (Phase 11.2).** `agent/src/agent/tools.py` is a bit-exact
+Python port of `server/src/realtime/tools.js`: same wire shape (snake_case
+keys), same state-mutation semantics on the `interviews` collection
+(`pending → in_progress + startedAt` on first call, `currentIndex++`,
+`completed + endedAt` when exhausted, idempotent on re-call). When the
+flag is on, **Python owns these writes**; Node REST routes still own
+interview *creation* and `/end`.
+
 See `meta/manifest.md` Phase 11 and `~/.claude/plans/crystalline-sauteeing-treehouse.md`
 for the phased plan and DoD.
 
