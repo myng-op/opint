@@ -24,7 +24,7 @@ opint/
 ├── package.json              # root orchestration scripts
 ├── interviews/               # seed JSON — one file per QuestionSet
 │   └── sample_interview.json
-├── prompts/                  # human-authored planning docs
+├── meta/                     # dev/process docs (collaboration, planning)
 │   ├── behaviour.md          # collaboration rules (instruction hierarchy)
 │   ├── manifest.md           # current plan + project state + tech debt
 │   ├── PROMPTS.md            # log of influential prompts

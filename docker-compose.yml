@@ -22,8 +22,6 @@ services:
     environment:
       MONGO_URI: mongodb://mongo:27017/opint
       PY_AGENT_PORT: "8001"
-    volumes:
-      - ./prompts:/app/prompts:ro
 
 volumes:
   opint-mongo-data:

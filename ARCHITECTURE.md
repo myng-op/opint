@@ -264,7 +264,7 @@ Node keeps STT, TTS, WS, REST, and transcript persistence. Wire is HTTP
 REST, buffered (no token streaming): `POST /open` on WS connect,
 `POST /turn` per debounce flush. Checkpointer = `MongoDBSaver` against
 the same Mongo, collection `agent_checkpoints`, `thread_id = interviewId`.
-See `prompts/manifest.md` Phase 11 and `~/.claude/plans/crystalline-sauteeing-treehouse.md`
+See `meta/manifest.md` Phase 11 and `~/.claude/plans/crystalline-sauteeing-treehouse.md`
 for the phased plan and DoD.
 
 ## Open questions / decisions deferred

@@ -17,7 +17,7 @@
 Maintain exactly three files to manage context and state. Update these only upon completing a Phase:
 1.  **`README.md`**: Project overview, tech stack, and setup instructions.
 2.  **`ARCHITECTURE.md`**: Data flow diagrams (in Markdown/Mermaid), database schema, and "The Why" behind major library/pattern choices.
-3.  **`prompts/manifest.md`**: A consolidated state file containing:
+3.  **`meta/manifest.md`**: A consolidated state file containing:
     * **Current Plan:** The roadmap for the next 3 phases.
     * **Project State:** A 3-paragraph summary of built features and file structure.
     * **Technical Debt:** Known issues or pending refactors.

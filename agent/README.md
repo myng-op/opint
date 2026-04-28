@@ -1,7 +1,7 @@
 # opint agent (Python LangGraph sidecar)
 
 Experimental LangGraph-based agent service. Runs alongside the Node server.
-See `/Users/b743595/dev/opint/ARCHITECTURE.md` and `/Users/b743595/dev/opint/prompts/manifest.md` Phase 11.
+See `/Users/b743595/dev/opint/ARCHITECTURE.md` and `/Users/b743595/dev/opint/meta/manifest.md` Phase 11.
 
 ## Local dev
 

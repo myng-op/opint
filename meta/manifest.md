@@ -1,7 +1,7 @@
 # opint — Project Manifest
 
 Living state file for the AI Social Worker Interview System. Updated only at
-phase boundaries per `prompts/behaviour.md` §4.
+phase boundaries per `meta/behaviour.md` §4.
 
 ## Current Plan (next 3 phases)
 
@@ -64,7 +64,7 @@ checkpointer. Secondary win: LangSmith tracing on Anna's persona.
 `POST /open` + `POST /turn`. Plan in `~/.claude/plans/crystalline-sauteeing-treehouse.md`.
 
 - 11.0 Branch + `agent/` skeleton (uv, FastAPI `/healthz`, dockerised). **Done.**
-- 11.1 Move `prompts/anna/` to repo root, dual reader (Node + Py).
+- 11.1 Move Anna persona to `prompts/anna/` at repo root, dual reader (Node + Py).
 - 11.2 Mongo client + bit-exact `get_next_interview_question` parity in Py.
 - 11.3 `MongoDBSaver` wired, `thread_id = interviewId`.
 - 11.4 ReAct graph (agent + tools nodes, messages-only state).
@@ -108,7 +108,8 @@ voice — now tracked, was silently gitignored before this cleanup),
 in `client/src/`: `routes/{Interview,Review,ReviewDetail}.jsx`, shared
 `theme.js`, `components/`. Repo-root: `docker-compose.yml` (Mongo),
 `interviews/*.json` (seed data), `icons/` (SVGs — use these, do not
-author inline), `prompts/` (this file + `behaviour.md` + `archive/`).
+author inline), `meta/` (this file + `behaviour.md` + `archive/` — dev/process docs),
+`prompts/anna/` (Anna runtime persona — populated in Phase 11.1).
 
 **Where we are.** Demo-ready end-to-end. The pipeline is stable after the
 April 22 bugfix batch (silent-TTS / double-response / STT-disconnect
@@ -133,5 +134,5 @@ that pre-date this cleanup.
    internal demo only; revisit before any external exposure.
 5. **No production deploy story.** Local-only via Docker Compose; no
    Atlas / cloud target chosen yet.
-6. **`prompts/PROMPTS.md`** — historical prompt log not formally required
+6. **`meta/PROMPTS.md`** — historical prompt log not formally required
    by current `behaviour.md`. Decision (keep / archive / delete) deferred.
