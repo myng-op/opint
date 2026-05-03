@@ -44,9 +44,8 @@ def _language_name(locale: str) -> str:
 def build_system_prompt(language: str | None) -> str:
     """Assemble Anna's system prompt; append a language directive for non-English locales.
 
-    Mirrors `server/src/realtime/session.js` getSystemPrompt — same concat
-    order (persona → speech → mechanics → guardrails) and same `# Language`
-    block wording for parity with the Node path.
+    Concat order: persona → speech → mechanics → guardrails. The `# Language`
+    block is appended only for non-English locales.
     """
     base = _system_prompt_base()
     if not language or language.startswith("en"):

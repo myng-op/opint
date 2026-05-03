@@ -1,18 +1,19 @@
 # opint — AI Social Worker Interview System
 
 Conducts structured interviews by voice. The AI plays a warm, empathetic
-interviewer trained in social-worker-style listening, pulls questions
-one-by-one via tool calling, and (Phase 5) persists the transcript for later
-review.
+interviewer trained in social-worker-style listening, walks the participant
+through a configured question set, and persists the transcript for review.
 
 ## Stack
 
-- **Azure AI Foundry Chat Completions** — LLM step (deployment via `AZURE_AI_DEPLOYMENT`)
-- **Azure Cognitive Services Speech** — streaming STT + Neural TTS (DragonHD voices for English/Chinese, standard Neural for other locales) via `microsoft-cognitiveservices-speech-sdk`
-- **Node.js + Express + `ws`** — HTTP API and WebSocket bridge between browser and the Azure services
-- **MongoDB + Mongoose** — question bank, interviews, transcripts
+- **Python LangGraph sidecar** (`agent/`) — owns the LLM call, conversation history, tool dispatch, and Mongo writes. FastAPI on `:8001`.
+- **Azure AI Foundry Chat Completions** — LLM (called from the Python sidecar via `AzureChatOpenAI`)
+- **Azure Cognitive Services Speech** — Neural TTS (DragonHD voices for English/Chinese, standard Neural for other locales) via `microsoft-cognitiveservices-speech-sdk`
+- **GPT Realtime API** — STT + server-side VAD (Azure OpenAI or OpenAI direct). Replaces Azure Speech SDK STT — native VAD gives instant barge-in and ~700ms turn detection.
+- **Node.js + Express + `ws`** — HTTP API + WebSocket proxy: browser ↔ GPT Realtime (STT), browser ↔ Azure Speech (TTS), browser ↔ Py sidecar for the agent turn
+- **MongoDB + Mongoose** — question bank, interviews, transcripts (Node side); raw `pymongo` for the same DB on the Py side
 - **React (Vite)** — single-surface interviewee UI
-- **Docker Compose** — local Mongo
+- **Docker Compose** — local Mongo + Py agent
 
 ## Layout
 
@@ -36,23 +37,25 @@ opint/
 │   ├── PROMPTS.md            # log of influential prompts
 │   └── archive/              # historical phase changelogs
 │       └── logs.md
-├── server/                   # Node backend
+├── server/                   # Node backend (STT/TTS + REST + WS proxy)
+│   ├── legacy/               # archived v1 Node-side LLM+tool loop (read-only)
 │   └── src/
 │       ├── index.js          # http + ws entrypoint
 │       ├── config.js         # env loading + validation
 │       ├── db.js             # mongoose connection + ping
 │       ├── seed.js           # reads /interviews, upserts QuestionSets
 │       ├── logging.js        # compact formatter for realtime-WS events
-│       ├── realtime.js       # browser <-> Azure WS bridge, tool dispatch
+│       ├── realtime.js       # browser <-> GPT Realtime (STT) + Azure Speech (TTS) + Py sidecar
 │       ├── realtime/
-│       │   ├── session.js    # tool schema; loads ../../../prompts/anna/*.md
-│       │   └── tools.js      # get_next_interview_question handler
+│       │   └── sttClient.js  # GPT Realtime API WebSocket client (VAD + transcription)
 │       ├── models/
 │       │   ├── QuestionSet.js
 │       │   └── Interview.js
 │       └── routes/
 │           ├── questionSets.js
 │           └── interviews.js
+├── agent/                    # Python LangGraph sidecar (FastAPI :8001)
+│   └── src/agent/            # graph, tools, prompts, checkpointer, endpoints
 └── client/                   # React frontend (vite)
     └── src/
         ├── App.jsx           # router shell (/, /review, /review/:id)
@@ -73,9 +76,15 @@ opint/
    AZURE_AI_KEY="<key>"
    AZURE_AI_DEPLOYMENT="<chat-completions-deployment-name>"
 
-   # STT + TTS — Azure Cognitive Services Speech
+   # TTS — Azure Cognitive Services Speech
    AZURE_SPEECH_KEY="<key>"
    AZURE_SPEECH_REGION="<region>"          # e.g. swedencentral
+
+   # STT + VAD — GPT Realtime API (Azure OpenAI preferred; OpenAI direct as fallback)
+   AZURE_REALTIME_ENDPOINT="https://<resource>.openai.azure.com/"
+   AZURE_REALTIME_DEPLOYMENT="gpt-4o-realtime-preview"
+   AZURE_REALTIME_KEY="<key>"
+   # OR: OPENAI_REALTIME_KEY="<key>" (if no Azure Realtime deployment)
 
    MONGO_URI="mongodb://localhost:27017/opint"
    ```
@@ -85,8 +94,8 @@ opint/
    ```
    AZURE_AI_API_VERSION                    # default "2024-10-21"
    AZURE_SPEECH_ENDPOINT                   # only if overriding the regional endpoint
-   AZURE_STT_LANGUAGE                      # default "en-US" — overridden per-interview by the language picker
    AZURE_TTS_VOICE                         # default "en-US-JennyMultilingualNeural"; recommended: "en-US-Ava:DragonHDLatestNeural"
+   OPENAI_REALTIME_MODEL                   # default "gpt-4o-realtime-preview" (only used with OPENAI_REALTIME_KEY)
    PORT                                    # default 3001
    ```
 
@@ -125,48 +134,26 @@ need to free the ports manually: `npm run kill-ports`.
 
 Stop Mongo when you're done: `npm run mongo:down`.
 
-## Running with the Python LangGraph sidecar (branch `py-langgraph-agent`)
+## Python sidecar
 
-Experimental — replaces the Node-side LLM+tool-loop with a Python
-LangGraph agent (FastAPI sidecar at `:8001`). Phase 11 in
-`meta/manifest.md`.
-
-1. Bring up the agent service:
-
-   ```
-   docker compose up -d agent
-   ```
-
-2. Flip the flag in your `.env`:
-
-   ```
-   USE_PY_AGENT=true
-   PY_AGENT_URL=http://localhost:8001
-   ```
-
-3. Start the Node server + client as usual (`npm run dev`).
-
-When the flag is on, `realtime.js` routes the LLM+tool-loop to the Py
-agent. STT, TTS, barge-in, and transcript persistence stay in Node.
-If the agent service is unreachable, Node emits `response.error` on
-the WS — there is **no silent fallback** to the Node path. Set
-`USE_PY_AGENT=false` (or omit it) to revert.
-
-Optional LangSmith tracing — set in `.env` and rebuild the agent
-container:
+The agent path is the only path. Bring up the service alongside Mongo
+before `npm run dev`:
 
 ```
-LANGSMITH_TRACING=true
-LANGSMITH_API_KEY=ls__...
-LANGSMITH_PROJECT=opint
+docker compose up -d mongo agent
 ```
 
-Bench (DoD gate 3, manual): `BENCH_LIVE=1 INTERVIEW_ID=<oid>
+`PY_AGENT_URL` defaults to `http://localhost:8001`; override only if
+you're running the sidecar elsewhere. If the sidecar is unreachable,
+Node emits `response.error` on the WS — there is **no silent fallback**.
+
+The previous Node-side LLM + tool loop is archived under `server/legacy/`
+for historical reference; it is not imported by the running server.
+
+Bench (manual, gated): `BENCH_LIVE=1 INTERVIEW_ID=<oid>
 uv run --directory agent python scripts/bench.py`.
 
 ## REST surface
-
-See `ARCHITECTURE.md` for the full table. Quick reference:
 
 - `GET  /api/question-sets`            — list (title + count)
 - `GET  /api/question-sets/:id`        — full detail with ordered questions

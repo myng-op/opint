@@ -27,10 +27,6 @@ class Settings(BaseSettings):
     py_agent_port: int = Field(default=8001, alias="PY_AGENT_PORT")
     prompts_dir: str = Field(default=str(DEFAULT_PROMPTS_DIR), alias="PROMPTS_DIR")
 
-    langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
-    langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY")
-    langsmith_project: str = Field(default="opint", alias="LANGSMITH_PROJECT")
-
 
 @lru_cache
 def get_settings() -> Settings:

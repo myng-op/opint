@@ -1,9 +1,7 @@
-"""Interview-state tool: hand out the next item, advance state.
+"""Dispatcher node — reads currentIndex, fetches question, routes.
 
-Raw pymongo (no ODM). Wire format returned to the LLM is snake_case;
-state-mutation semantics on the `interviews` document:
-`pending → in_progress + startedAt` on first call, `currentIndex++` on
-each call, `completed + endedAt` when exhausted, idempotent on re-call.
+NEVER increments the index. Only `advance` does that.
+Flips pending → in_progress on first dispatch.
 """
 from datetime import datetime, timezone
 
@@ -20,11 +18,16 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def get_next_interview_question(
-    db: Database,
-    interview_id: str,
-    question_set: dict,
-) -> dict:
+def dispatch(db: Database, interview_id: str, question_set: dict) -> dict:
+    """Read currentIndex, fetch question, route based on type.
+
+    Returns:
+        dict with keys:
+            - route: "non_question" | "question" | "done"
+            - current_question: dict (if not done)
+            - done: True (if exhausted)
+            - closing_note: str (if done)
+    """
     interviews = db["interviews"]
     oid = ObjectId(interview_id)
     interview = interviews.find_one({"_id": oid})
@@ -40,22 +43,25 @@ def get_next_interview_question(
                 {"_id": oid},
                 {"$set": {"status": "completed", "endedAt": _now(), "updatedAt": _now()}},
             )
-        return {"done": True, "closing_note": CLOSING_NOTE}
+        return {"done": True, "closing_note": CLOSING_NOTE, "route": "done"}
 
     q = question_set["questions"][idx]
 
-    set_fields: dict = {"currentIndex": idx + 1, "updatedAt": _now()}
     if interview["status"] == "pending":
-        set_fields["status"] = "in_progress"
-        set_fields["startedAt"] = _now()
-    interviews.update_one({"_id": oid}, {"$set": set_fields})
+        interviews.update_one(
+            {"_id": oid},
+            {"$set": {"status": "in_progress", "startedAt": _now(), "updatedAt": _now()}},
+        )
 
-    return {
+    current_question = {
         "key": q["key"],
         "content": q["content"],
         "type": q["type"],
-        "requirement": q["requirement"],
+        "requirement": q.get("requirement", ""),
         "max_sec": q.get("maxSec"),
         "question_number": idx + 1,
         "total_questions": total,
     }
+
+    route = "non_question" if q["type"] == "non-question" else "question"
+    return {"current_question": current_question, "route": route}

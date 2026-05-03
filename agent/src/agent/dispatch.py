@@ -1,4 +1,4 @@
-"""Tool-call dispatcher. Mirrors `server/src/realtime/tools.js` handleToolCall."""
+"""Tool-call dispatcher invoked by the agent graph."""
 from pymongo.database import Database
 
 from agent.tools import get_next_interview_question

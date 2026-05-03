@@ -1,4 +1,4 @@
-"""Bit-exact parity tests vs server/src/realtime/tools.js lines 8–79."""
+"""Tests for the interview-state tool: state transitions + wire shape."""
 from datetime import datetime
 
 from bson import ObjectId

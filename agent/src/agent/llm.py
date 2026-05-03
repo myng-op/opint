@@ -1,8 +1,6 @@
 """AzureChatOpenAI factory.
 
-Reads the same `AZURE_AI_*` env vars the Node path uses (see
-`server/src/realtime.js` chatCompletion) so the LLM is held constant
-across the Node/Py paths — only the graph runtime differs.
+Reads `AZURE_AI_*` env vars and returns a configured chat model.
 """
 import re
 
@@ -10,9 +8,9 @@ from langchain_openai import AzureChatOpenAI
 
 from agent.config import Settings, get_settings
 
-# Mirror server/src/realtime.js:66 — accept endpoints written with or
-# without a trailing /openai/vN segment. AzureChatOpenAI wants the bare
-# resource host; the langchain client appends /openai/deployments/...
+# Accept endpoints written with or without a trailing /openai/vN segment.
+# AzureChatOpenAI wants the bare resource host; the langchain client
+# appends /openai/deployments/...
 _ENDPOINT_SUFFIX_RE = re.compile(r"/openai/v\d+/?$")
 
 

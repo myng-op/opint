@@ -10,9 +10,13 @@ updated as each phase lands.
 │  React UI   │ ──────▶ │  Node proxy  │ ─────────▶ │  Azure AI Foundry        │
 │ (browser)   │ ◀────── │  + REST API  │ ◀───────── │   (Chat Completions LLM) │
 └─────────────┘         └──┬───────┬───┘            └──────────────────────────┘
-                           │       │  WSS/HTTPS     ┌──────────────────────────┐
+                           │       │  WSS           ┌──────────────────────────┐
+                           │       ├──────────────▶ │  GPT Realtime API        │
+                           │       │  ◀────────────│   (STT + VAD only)       │
+                           │       │               └──────────────────────────┘
+                           │       │  HTTPS         ┌──────────────────────────┐
                            │       └──────────────▶ │  Azure Speech            │
-                           │           ◀────────────│   (streaming STT + TTS)  │
+                           │           ◀────────────│   (TTS — DragonHD)       │
                            ▼                        └──────────────────────────┘
                     ┌──────────────┐
                     │   MongoDB    │
@@ -27,9 +31,10 @@ updated as each phase lands.
   base64-chunked deltas). The frame contract was deliberately preserved
   through the April 22 STT→LLM→TTS migration so the client did not need
   to change.
-- The server orchestrates three Azure services per turn: incoming PCM
-  feeds the Speech SDK recognizer (STT); the recognized utterance feeds
-  Chat Completions (LLM); the LLM's text reply feeds the Speech SDK
+- The server orchestrates three services per turn: incoming PCM is
+  forwarded to the GPT Realtime API over a persistent WebSocket (STT +
+  server-side VAD); the transcribed utterance feeds the Python LangGraph
+  sidecar (LLM reasoning); the assistant text feeds the Azure Speech SDK
   synthesizer (TTS); the resulting PCM streams back to the browser.
 - REST endpoints on the same Node process handle CRUD for question sets,
   interview lifecycle, and transcript reads.
@@ -40,7 +45,7 @@ updated as each phase lands.
 |-----------------------------------------|---------------------------------------------------------------------------|
 | Express                                 | Smallest viable HTTP framework; no opinions to fight.                     |
 | `ws`                                    | Standard Node WS lib for the browser↔server bridge.                       |
-| `microsoft-cognitiveservices-speech-sdk`| Streaming STT + TTS in one package; `PushAudioInputStream` lets us feed it the same PCM frames the browser sends. |
+| `microsoft-cognitiveservices-speech-sdk`| TTS only (DragonHD voices). STT moved to GPT Realtime API for native VAD + lower latency. |
 | `fetch` (native)                        | LLM step is a single HTTPS call to Azure AI Foundry — no SDK needed.      |
 | Mongoose                                | Schema validation + model methods; makes the data model explicit.         |
 | Vite                                    | Fast dev server, native ESM, simple WS proxy config.                      |
@@ -51,19 +56,20 @@ updated as each phase lands.
 
 - Browser captures mic at 24 kHz mono via `AudioContext`. Float32 → Int16 PCM
   → base64, sent as `input_audio_buffer.append` events on the WS.
-- Server pushes incoming PCM into a Speech SDK `PushAudioInputStream` that
-  feeds a continuous `SpeechRecognizer` (STT). Endpointing is handled by the
-  recognizer itself, not by the browser.
-- The recognizer's `recognized` event fires on each silence gap. A 1.5 s
-  debounce (`RECOGNIZE_DEBOUNCE_MS`) accumulates fragments into a
-  `pendingUtterance` so a single sentence with mid-thought pauses doesn't
-  trigger multiple LLM turns.
-- After debounce, `runAssistantTurn()` calls Chat Completions (LLM) with
-  the system prompt + transcript history + the new utterance. The tool
-  loop iterates up to 20 times: the model can call
-  `get_next_interview_question`, the server resolves it against Mongo,
-  and the loop continues until the model emits text content.
-- LLM text (plaintext, possibly with paralinguistics like `[laughter]`,
+- Server forwards audio frames as-is (base64 PCM16) to the GPT Realtime
+  API over a persistent WebSocket (`RealtimeSttClient`). The Realtime API
+  provides server-side VAD and Whisper-based transcription.
+- VAD fires `input_audio_buffer.speech_started` immediately when the user
+  begins speaking — this triggers barge-in (TTS abort + `response.cancelled`
+  to the browser) with no delay.
+- After the user stops speaking (~700ms silence), the API auto-commits
+  the audio buffer and produces a final transcript via
+  `conversation.item.input_audio_transcription.completed`.
+- `runAssistantTurn()` POSTs the transcript to the Python sidecar's
+  `/turn` endpoint. The Py service runs the LangGraph state machine
+  (dispatcher / classifier / followup / advance nodes, checkpointed in
+  Mongo) and returns the assistant's text reply.
+- Assistant text (plaintext, possibly with paralinguistics like `[laughter]`,
   `…`, em-dashes — DragonHD voices auto-detect emotion natively, so SSML
   is no longer used) feeds the Speech SDK synthesizer (`speakTextAsync`,
   `Raw24Khz16BitMonoPcm`).
@@ -71,8 +77,8 @@ updated as each phase lands.
   on the same WS — same frame shape the browser already played from the
   previous Realtime build, so the client's gapless `AudioContext`
   scheduler works unchanged.
-- **Barge-in.** When the recognizer fires `recognized` while TTS is
-  speaking, the server aborts the active synthesizer and emits
+- **Barge-in.** Instant — `speech_started` fires as soon as VAD detects
+  the user's voice. The server aborts the active synthesizer and emits
   `response.cancelled`; the client flushes its scheduled
   `BufferSource` nodes so Anna stops mid-sentence.
 
@@ -178,7 +184,7 @@ in order without a separate sort pass.
 ## Realtime session lifecycle (post-migration)
 
 ```
- browser                       server                       Azure (Speech + AI Foundry)
+ browser                       server                       External services
    │                              │                                 │
    │ POST /api/interviews ───────▶│                                 │
    │   { questionSetId,           │                                 │
@@ -186,102 +192,89 @@ in order without a separate sort pass.
    │◀─────────── { _id } ─────────│                                 │
    │                              │                                 │
    │ WS open ?interviewId=<id> ──▶│ load Interview + QuestionSet    │
-   │                              │ build system prompt             │
-   │                              │ create Speech recognizer (STT)  │
-   │                              │   for interview.language        │
+   │                              │ open Realtime API WS (STT+VAD)  │
    │                              │ create Speech synthesizer (TTS) │
    │                              │   for interview.ttsVoice        │
    │                              │                                 │
    │                              │ runAssistantTurn() — opening    │
-   │                              │   LLM ─ Chat Completions ──────▶│
-   │                              │   ◀───────────────── tool_call ─│
-   │                              │   resolve tool against Mongo    │
-   │                              │   LLM (loop) ──────────────────▶│
-   │                              │   ◀──────── content (greeting) ─│
-   │                              │   TTS ─ speakTextAsync ────────▶│
+   │                              │   POST /open → Py sidecar       │
+   │                              │   ◀──── { assistantText } ──────│
+   │                              │   TTS ─ speakTextAsync ────────▶│ (Azure Speech)
    │◀── response.audio.delta ─────│◀──────────── PCM frames ────────│
    │                              │                                 │
-   │ input_audio_buffer.append ──▶│ push into recognizer's stream   │
-   │   (PCM16 24kHz)              │                                 │
-   │                              │ STT recognized event            │
-   │                              │   debounced 1.5 s →             │
-   │                              │   runAssistantTurn(utterance)   │
-   │                              │   LLM (loop, max 20 iter) ─────▶│
-   │                              │   ◀──── tool_calls / content ───│
-   │                              │   TTS chunks ──────────────────▶│
+   │ input_audio_buffer.append ──▶│ forward to Realtime API WS ────▶│ (GPT Realtime)
+   │   (PCM16 24kHz base64)       │                                 │
+   │                              │◀─ speech_started (VAD) ─────────│
+   │                              │◀─ transcription.completed ──────│
+   │                              │   runAssistantTurn(transcript)   │
+   │                              │   POST /turn → Py sidecar       │
+   │                              │   ◀──── { assistantText } ──────│
+   │                              │   TTS chunks ──────────────────▶│ (Azure Speech)
    │◀── response.audio.delta ─────│                                 │
    │                              │                                 │
-   │   (user starts speaking)     │ STT recognized while TTS active │
+   │   (user starts speaking)     │◀─ speech_started (instant) ─────│ (GPT Realtime)
    │                              │   → abort current synthesizer   │
    │◀── response.cancelled ───────│                                 │
    │   flush playback buffers     │                                 │
 ```
 
 Key properties:
-- **Session ownership is server-side.** System prompt, tool schema, audio
-  format — all authored in `server/src/realtime/session.js`. The browser
+- **Session ownership is server-side.** System prompt, audio format —
+  authored in `agent/src/agent/prompts.py` + `prompts/anna/`. The browser
   cannot override persona or inject tools.
-- **Prompt is modular.** `session.js` concatenates four files from
-  `prompts/anna/` (repo root) at boot: `persona.md` (voice + silence +
-  opening), `mechanics.md` (tool usage, follow-ups, closing),
+- **Prompt is modular.** `agent/src/agent/prompts.py` concatenates four
+  files from `prompts/anna/` at boot: `persona.md` (voice + silence +
+  opening), `mechanics.md` (item delivery, follow-ups, closing),
   `guardrails.md` (ethics, neutrality, de-escalation), `speech.md`
   (natural-speech cues — fillers, ellipses, em-dashes, paralinguistics
   like `[laughter]` that DragonHD voices render natively). Edit a file,
-  restart the server, the new prompt takes effect on the next WS
-  connection. The Python LangGraph sidecar reads the same four files
-  from the same location, so persona edits propagate to both paths.
-- **STT debounce is 1.5 s.** `RECOGNIZE_DEBOUNCE_MS` accumulates
-  fragmentary `recognized` events into a single utterance so a thoughtful
-  participant who pauses mid-sentence doesn't trigger multiple LLM turns.
-- **STT recognizer is rebuildable.** If the recognizer enters
-  `Disconnected`, `rebuildRecognizer()` creates a fresh SDK instance +
-  push stream rather than restarting the same one (the SDK's restart
-  path was unreliable in our testing).
+  restart the agent, the new prompt takes effect on the next interview.
+- **Native VAD replaces debounce.** The GPT Realtime API's server-side
+  VAD (~700ms silence threshold) detects turn boundaries. No hand-rolled
+  debounce timer — turns fire as soon as the user stops speaking.
+- **Barge-in is instant.** `speech_started` fires the moment the user
+  begins speaking. TTS aborts immediately, no waiting for a full
+  recognition result.
 - **AI greets first.** `runAssistantTurn()` fires immediately on WS
   connect with no user utterance, so Anna speaks the opening before
   the participant says anything.
-- **Tool dispatch is server-side.** Chat Completions returns a
-  `tool_calls` array; the server runs each call against Mongo (advancing
-  `Interview.currentIndex`) and feeds the results back into the next
-  iteration of the LLM loop.
+- **Tool dispatch is sidecar-side.** The Python LangGraph state machine
+  (dispatcher / classifier / followup / advance) manages interview flow.
+  Node never touches the LLM API.
 - **`non-question` items auto-chain.** Items typed `non-question` (intro,
-  transition, closing) skip waiting for a user response — the loop
-  continues until a question-typed item is emitted.
-- **Questions are pulled, not pushed.** The model decides when it's
-  satisfied and calls `get_next_interview_question` — we never push
-  question text into the conversation unilaterally.
+  transition, closing) skip waiting for a user response — the dispatcher
+  loops until a question-typed item is emitted.
 - **Per-interview language.** `Interview.language` (BCP-47) and
   `Interview.ttsVoice` are set when the participant picks a language on
-  the client. `realtime.js` reads them at WS open and passes them to
-  STT, TTS, and the system-prompt language directive.
+  the client. `realtime.js` reads them at WS open and passes the voice
+  to TTS and the language to the system-prompt directive.
 
-## Experimental: Python LangGraph agent sidecar
+## Python LangGraph agent sidecar
 
-Lives on branch `py-langgraph-agent` only. A FastAPI service in `agent/`
-(uv-managed, Python 3.12) that — when `USE_PY_AGENT=true` — replaces the
-Node-side LLM call + tool loop in `realtime.js`. Owns the LangGraph state
-machine, tool dispatch, and Mongo writes for interview-state mutations.
-Node keeps STT, TTS, WS, REST, and transcript persistence. Wire is HTTP
-REST, buffered (no token streaming): `POST /open` on WS connect,
-`POST /turn` per debounce flush. Checkpointer = `MongoDBSaver` against
-the same Mongo, collection `agent_checkpoints`, `thread_id = interviewId`.
+A FastAPI service in `agent/` (uv-managed, Python 3.12) owns the LLM
+call, tool dispatch, and Mongo writes for interview-state mutations.
+Node keeps STT (via GPT Realtime API), TTS, WS, REST, and transcript
+persistence. Wire is HTTP REST, buffered (no token streaming):
+`POST /open` on WS connect, `POST /turn` per VAD-detected utterance.
+Checkpointer = `MongoDBSaver` against the same Mongo, collection
+`agent_checkpoints`, `thread_id = interviewId`.
 
-**Tool parity (Phase 11.2).** `agent/src/agent/tools.py` is a bit-exact
-Python port of `server/src/realtime/tools.js`: same wire shape (snake_case
-keys), same state-mutation semantics on the `interviews` collection
-(`pending → in_progress + startedAt` on first call, `currentIndex++`,
-`completed + endedAt` when exhausted, idempotent on re-call). When the
-flag is on, **Python owns these writes**; Node REST routes still own
-interview *creation* and `/end`.
+The previous Node-side LLM + tool loop is archived under `server/legacy/`
+for historical reference; it is not imported by the running server.
 
-**Agent graph (Phase 11.4).** ReAct skeleton — single `agent` node + a
-`ToolNode` + the standard conditional edge (route to `tools` if AIMessage
-carries tool_calls, else END). State is messages-only
-(`Annotated[list, add_messages]`); per-interview state like `currentIndex`
-or `last_item_type` is never stored in the graph state — re-derived from
-the last `ToolMessage` on each agent invocation.
+**Tool parity.** `agent/src/agent/tools.py` mutates the `interviews`
+collection with the same semantics the Node v1 path used:
+`pending → in_progress + startedAt` on first call, `currentIndex++`,
+`completed + endedAt` when exhausted, idempotent on re-call. Node REST
+routes still own interview *creation* and `/end`.
 
-**HTTP contract (Phase 11.5).**
+**Agent graph.** Deterministic state machine: dispatcher → responder →
+classifier → (advance | followup) nodes. The LLM no longer holds the
+question index; the graph does. `advance` writes `currentIndex++` only
+when the classifier confirms the requirement is satisfied. Followup cap
+of 2 prevents infinite loops.
+
+**HTTP contract.**
 
 | Method | Path       | Body                                | Returns                   |
 |--------|------------|-------------------------------------|---------------------------|
@@ -301,38 +294,16 @@ interview without rebuilds. Errors:
 - `422` — malformed body (Pydantic).
 - `502` — graph invocation raised, or final AIMessage was empty.
 
-**Node cutover (Phase 11.6).** `server/src/realtime.js`'s
-`runAssistantTurn` now takes an optional `userText` arg. When
-`config.pyAgent.useEnvAgent` is true (env `USE_PY_AGENT=true`), the
-function defers to a single buffered POST to the Py sidecar:
-`POST /open` if `userText === null` (opening greeting), `POST /turn`
-otherwise. The browser audio-frame contract, the STT debounce, the TTS
-synth, the barge-in via `currentTts.abort`, and `persistTurn` are all
-unchanged — only the LLM+tool-loop block is replaced. On Py failure
-(network, 5xx, timeout) Node emits `response.error` on the WS and logs
-loud; **no silent fallback** to the Node Chat Completions path. With
-the flag off, the original tool-loop runs unchanged.
+**Node delegation.** `server/src/realtime.js`'s `runAssistantTurn`
+defers entirely to the Py sidecar: `POST /open` on WS connect,
+`POST /turn` per VAD-detected utterance. Browser audio-frame contract,
+GPT Realtime STT, TTS synth, barge-in via `currentTts.abort`, and
+`persistTurn` are unchanged. On Py failure (network, 5xx, timeout) Node
+emits `response.error` on the WS and logs loud; **no silent fallback**.
 
-**Tracing (Phase 11.7).** `agent/src/agent/langsmith_setup.py` reads
-`LANGSMITH_TRACING` / `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT` at
-FastAPI import time. When the user opts in, those vars are populated
-in `os.environ` and LangChain auto-traces every graph step. The
-service must boot + serve without LangSmith creds — tracing is purely
-opt-in, not load-bearing. Helper scripts:
-`agent/scripts/dump_baseline.py` captures a Node-path transcript as
-the parity baseline (DoD gate 1); `agent/scripts/bench.py` measures
-per-turn latency on the Py path (DoD gate 3). Both are user-driven —
-not part of CI.
-
-Force-tool-call mechanic (mirrors `realtime.js:331`): when the most
-recent `ToolMessage` JSON content has `type == 'non-question'`, the next
-agent invocation binds the LLM with `tool_choice` forcing
-`get_next_interview_question`. Without this the model drifts on
-non-question items (intro, transitions, closing) instead of immediately
-calling the tool to advance.
-
-See `meta/manifest.md` Phase 11 and `~/.claude/plans/crystalline-sauteeing-treehouse.md`
-for the phased plan and DoD.
+Helper scripts: `agent/scripts/dump_baseline.py` captures a transcript
+as a parity baseline; `agent/scripts/bench.py` measures per-turn
+latency. Both are user-driven, not part of CI.
 
 ## Open questions / decisions deferred
 

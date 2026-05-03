@@ -23,10 +23,17 @@ if (missing.length) {
   process.exit(1);
 }
 
-const useEnvAgent = process.env.USE_PY_AGENT === 'true';
 const pyAgentUrl = process.env.PY_AGENT_URL || 'http://localhost:8001';
-if (useEnvAgent && !pyAgentUrl) {
-  console.error('USE_PY_AGENT=true but PY_AGENT_URL is empty');
+if (!pyAgentUrl) {
+  console.error('PY_AGENT_URL is empty — cannot reach Python sidecar');
+  process.exit(1);
+}
+
+// GPT Realtime API — at least one provider (Azure or OpenAI direct) must be configured.
+const hasAzureRealtime = process.env.AZURE_REALTIME_ENDPOINT && process.env.AZURE_REALTIME_KEY && process.env.AZURE_REALTIME_DEPLOYMENT;
+const hasOpenaiRealtime = !!process.env.OPENAI_REALTIME_KEY;
+if (!hasAzureRealtime && !hasOpenaiRealtime) {
+  console.error('GPT Realtime API not configured — set AZURE_REALTIME_ENDPOINT+KEY+DEPLOYMENT or OPENAI_REALTIME_KEY');
   process.exit(1);
 }
 
@@ -57,12 +64,19 @@ export const config = {
   mongo: {
     uri: process.env.MONGO_URI || 'mongodb://localhost:27017/opint',
   },
-  // Phase 11.6 — Python LangGraph sidecar cutover. When `useEnvAgent` is true
-  // realtime.js delegates the LLM+tool-loop step to the Py service instead of
-  // calling Azure Chat Completions directly.
+  // Python LangGraph sidecar — owns the LLM call, tool dispatch, conversation
+  // history, and Mongo writes for the agent path. Node only proxies STT/TTS
+  // and persists transcript turns.
   pyAgent: {
-    useEnvAgent,
     url: pyAgentUrl,
+  },
+  // GPT Realtime API — used for STT + VAD only. Azure preferred; OpenAI direct as fallback.
+  realtime: {
+    azureEndpoint: process.env.AZURE_REALTIME_ENDPOINT || null,
+    azureDeployment: process.env.AZURE_REALTIME_DEPLOYMENT || null,
+    azureKey: process.env.AZURE_REALTIME_KEY || null,
+    openaiKey: process.env.OPENAI_REALTIME_KEY || null,
+    openaiModel: process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview',
   },
 };
 
@@ -80,6 +94,8 @@ console.log(
   `[config] stt.region=${config.stt.region} stt.language=${config.stt.language} ` +
     `stt.key=<${lenOf(config.stt.key)} chars> tts.voice=${config.tts.voice}`
 );
+console.log(`[config] pyAgent.url=${config.pyAgent.url}`);
 console.log(
-  `[config] pyAgent.useEnvAgent=${config.pyAgent.useEnvAgent} pyAgent.url=${config.pyAgent.url}`
+  `[config] realtime: ${hasAzureRealtime ? 'Azure' : 'OpenAI direct'} ` +
+    `${hasAzureRealtime ? `endpoint=${config.realtime.azureEndpoint} deployment=${config.realtime.azureDeployment}` : `model=${config.realtime.openaiModel}`}`
 );

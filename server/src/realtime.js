@@ -1,15 +1,17 @@
-// STT → LLM → TTS pipeline. Replaces the Azure Realtime WS proxy.
+// STT → Py-agent → TTS pipeline.
 //
 // Per-connection flow:
 //   1. Browser opens WS with ?interviewId=<id>. We validate Interview + QuestionSet.
-//   2. Azure Speech SDK SpeechRecognizer receives streaming PCM16 from the browser
-//      via a PushAudioInputStream. When a final recognition fires, we call the LLM.
-//   3. LLM (Azure AI Foundry Chat Completions) processes conversation history +
-//      tool definitions. Tool calls loop until the model produces final text.
-//   4. Azure Speech SDK SpeechSynthesizer converts the text to PCM16 audio and
-//      streams it back to the browser in the same frame format the client already expects.
+//   2. GPT Realtime API provides server-side VAD + transcription. Audio frames from
+//      the browser are forwarded directly. Native VAD events drive turn detection —
+//      no hand-rolled debounce.
+//   3. The Py sidecar owns the LLM call, conversation history, tool dispatch, and
+//      Mongo writes. Node never talks to Azure OpenAI directly anymore — the
+//      legacy Node-side LLM + tool loop lives under `server/legacy/` for reference.
+//   4. Azure Speech SDK SpeechSynthesizer converts the assistant text to PCM16
+//      audio and streams it to the browser in the existing frame format.
 //
-// Frame contract with the browser (unchanged from the Realtime era):
+// Frame contract with the browser (unchanged):
 //   Browser → server: { type: 'input_audio_buffer.append', audio: '<base64 PCM16>' }
 //   Server → browser: { type: 'response.audio.delta', delta: '<base64 PCM16>' }
 //                      { type: 'response.audio_transcript.delta', delta: '...' }
@@ -23,8 +25,7 @@ import { config } from './config.js';
 import { Interview } from './models/Interview.js';
 import { QuestionSet } from './models/QuestionSet.js';
 import { TranscriptTurn } from './models/TranscriptTurn.js';
-import { getSystemPrompt, getToolDefinition } from './realtime/session.js';
-import { handleToolCall } from './realtime/tools.js';
+import { RealtimeSttClient } from './realtime/sttClient.js';
 
 // Strip SSML-like tags the LLM may still emit. DragonHD auto-detects
 // emotion and paralinguistics from plaintext — we just need clean text.
@@ -47,68 +48,8 @@ function send(client, obj) {
   if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(obj));
 }
 
-function b64ToInt16(b64) {
-  const bin = Buffer.from(b64, 'base64');
-  return new Int16Array(bin.buffer, bin.byteOffset, bin.byteLength / 2);
-}
-
 function bufferToBase64(buf) {
   return Buffer.from(buf).toString('base64');
-}
-
-// ---------------------------------------------------------------------------
-// LLM — Azure AI Foundry Chat Completions via fetch
-// ---------------------------------------------------------------------------
-
-async function chatCompletion(messages, tools, toolChoice = 'auto') {
-  // Azure OpenAI expects: {host}/openai/deployments/{dep}/chat/completions
-  // Strip any trailing path segments like /openai/v1 from the configured endpoint.
-  const base = config.llm.endpoint.replace(/\/openai\/v\d+\/?$/, '').replace(/\/$/, '');
-  const url =
-    `${base}/openai/deployments/${config.llm.deployment}` +
-    `/chat/completions?api-version=${config.llm.apiVersion}`;
-  const body = { messages, tools, tool_choice: toolChoice };
-  console.log(`[llm] POST ${url} messages=${messages.length} tools=${tools.length} tool_choice=${JSON.stringify(toolChoice)}`);
-  const started = Date.now();
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'api-key': config.llm.apiKey,
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(60_000), // 60s hard timeout
-  });
-  const elapsed = Date.now() - started;
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`LLM ${res.status} (${elapsed}ms): ${text.slice(0, 300)}`);
-  }
-  const json = await res.json();
-  const choice = json.choices?.[0];
-  console.log(
-    `[llm] ← ${res.status} (${elapsed}ms) finish=${choice?.finish_reason}` +
-    (choice?.message?.tool_calls ? ` tool_calls=${choice.message.tool_calls.length}` : '') +
-    (choice?.message?.content ? ` content="${choice.message.content.slice(0, 80)}…"` : '')
-  );
-  return json;
-}
-
-// ---------------------------------------------------------------------------
-// STT — Azure Speech SDK continuous recognition on a PushAudioInputStream
-// ---------------------------------------------------------------------------
-
-function createRecognizer(cid, { language } = {}) {
-  const lang = language || config.stt.language;
-  const speechConfig = sdk.SpeechConfig.fromSubscription(config.stt.key, config.stt.region);
-  speechConfig.speechRecognitionLanguage = lang;
-  // 16-bit PCM mono 24 kHz — matches the browser's capture format.
-  const format = sdk.AudioStreamFormat.getWaveFormatPCM(24000, 16, 1);
-  const pushStream = sdk.AudioInputStream.createPushStream(format);
-  const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
-  const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
-  console.log(`[rt ${cid}] STT recognizer created lang=${lang}`);
-  return { recognizer, pushStream };
 }
 
 // ---------------------------------------------------------------------------
@@ -197,141 +138,51 @@ export function attachRealtimeProxy(httpServer) {
     let browserInCount = 0;
     let audioOutCount = 0;
 
-    const conversationHistory = [
-      { role: 'system', content: getSystemPrompt(connLanguage) },
-    ];
-    const tools = [getToolDefinition()];
-
     // Current TTS job — stored so barge-in can abort it.
     let currentTts = null;
     let closed = false;
 
-    // Turn lock — prevent concurrent runAssistantTurn executions.
+    // Turn lock — prevent concurrent runAssistantTurn executions. Py owns
+    // conversation history via its checkpointer; when a turn is queued we
+    // remember the queued user utterance text. Null means "opening" → POST /open.
     let turnRunning = false;
     let turnQueued = false;
-    // Py-agent path is stateless on the Node side (Py owns history via
-    // its own checkpointer), so when a turn is queued we must remember
-    // the queued user utterance text. Null means "opening" → POST /open.
     let queuedUserText = null;
 
-    // Debounce — accumulate STT fragments before triggering LLM.
-    const RECOGNIZE_DEBOUNCE_MS = 1500; // wait 1.5s of silence after last fragment
-    let pendingUtterance = '';
-    let debounceTimer = null;
-    let sttFirstFragmentTime = null; // Phase 12 timing: track first fragment arrival
-
-    // ---- STT setup ----
-    let stt = createRecognizer(cid, { language: connLanguage });
-    let sttRebuilding = false;
-
-    function wireRecognizerEvents(rec) {
-      // Partial recognition → optional live user text in transcript panel.
-      rec.recognizing = (_s, e) => {
+    // ---- STT via GPT Realtime API (VAD + transcription) ----
+    const sttClient = new RealtimeSttClient({
+      config,
+      cid,
+      onSpeechStarted: () => {
         if (closed) return;
-        const text = e.result.text;
-        if (text) {
-          send(client, {
-            type: 'conversation.item.input_audio_transcription.delta',
-            delta: text,
-          });
-        }
-      };
-
-      // Final recognition → accumulate text, debounce before triggering LLM.
-      rec.recognized = (_s, e) => {
-        if (closed) return;
-        if (e.result.reason !== sdk.ResultReason.RecognizedSpeech) return;
-        const text = e.result.text;
-        if (!text || !text.trim()) return;
-
-        console.log(`[rt ${cid}] STT fragment: "${text.slice(0, 120)}"`);
-
-        // Barge-in: if TTS is playing, cancel it on the first fragment.
         if (currentTts) {
           console.log(`[rt ${cid}] barge-in — cancelling TTS`);
           currentTts.abort = true;
           currentTts = null;
           send(client, { type: 'response.cancelled' });
         }
+      },
+      onTranscriptionCompleted: (transcript) => {
+        if (closed) return;
+        console.log(`[rt ${cid}] STT final: "${transcript.slice(0, 120)}"`);
+        send(client, {
+          type: 'conversation.item.input_audio_transcription.completed',
+          transcript,
+        });
+        persistTurn('user', transcript);
+        runAssistantTurn(transcript);
+      },
+      onError: (err) => {
+        console.error(`[rt ${cid}] STT error:`, err.message);
+        if (!closed) send(client, { type: 'response.error', error: { message: `STT: ${err.message}` } });
+      },
+    });
+    sttClient.connect();
 
-        // Accumulate fragment.
-        if (!pendingUtterance) sttFirstFragmentTime = Date.now(); // Phase 12 timing
-        pendingUtterance += (pendingUtterance ? ' ' : '') + text;
-
-        // Reset debounce timer.
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          debounceTimer = null;
-          if (closed || !pendingUtterance.trim()) return;
-
-          const fullText = pendingUtterance;
-          pendingUtterance = '';
-          const sttElapsed = sttFirstFragmentTime ? Date.now() - sttFirstFragmentTime : 0;
-          sttFirstFragmentTime = null;
-
-          console.log(`[rt ${cid}] [timing] STT first-fragment→flush: ${sttElapsed}ms`);
-          console.log(`[rt ${cid}] STT final (debounced): "${fullText.slice(0, 120)}"`);
-
-          send(client, {
-            type: 'conversation.item.input_audio_transcription.completed',
-            transcript: fullText,
-          });
-
-          persistTurn('user', fullText);
-          if (config.pyAgent.useEnvAgent) {
-            // Py owns conversation history via its checkpointer; don't
-            // duplicate locally — pass the user text into the turn.
-            runAssistantTurn(fullText);
-          } else {
-            conversationHistory.push({ role: 'user', content: fullText });
-            runAssistantTurn();
-          }
-        }, RECOGNIZE_DEBOUNCE_MS);
-      };
-
-      rec.canceled = (_s, e) => {
-        if (e.reason !== sdk.CancellationReason.Error) return;
-        console.warn(`[rt ${cid}] STT canceled (error): ${e.errorDetails}`);
-        if (closed || sttRebuilding) return;
-        rebuildRecognizer();
-      };
-    }
-
-    function rebuildRecognizer() {
-      sttRebuilding = true;
-      console.log(`[rt ${cid}] rebuilding STT recognizer…`);
-      // Best-effort teardown of old recognizer.
-      try { stt.recognizer.close(); } catch (_) {}
-      try { stt.pushStream.close(); } catch (_) {}
-
-      stt = createRecognizer(cid, { language: connLanguage });
-      wireRecognizerEvents(stt.recognizer);
-      stt.recognizer.startContinuousRecognitionAsync(
-        () => {
-          sttRebuilding = false;
-          console.log(`[rt ${cid}] STT rebuilt and restarted`);
-        },
-        (err) => {
-          sttRebuilding = false;
-          console.error(`[rt ${cid}] STT rebuild start failed:`, err);
-        },
-      );
-    }
-
-    wireRecognizerEvents(stt.recognizer);
-
-    // Start continuous recognition.
-    stt.recognizer.startContinuousRecognitionAsync(
-      () => console.log(`[rt ${cid}] STT continuous recognition started`),
-      (err) => console.error(`[rt ${cid}] STT start failed:`, err),
-    );
-
-    // ---- Py-agent delegation (USE_PY_AGENT=true) ----
-    // Replaces the Node chatCompletion + tool loop with a single buffered
-    // POST to the Python LangGraph sidecar. Py owns conversation state via
-    // its Mongo checkpointer; Node keeps STT, TTS, debounce, barge-in, and
-    // transcript persistence (all unchanged). On Py failure we surface
-    // response.error to the WS — no silent fallback to the Node path.
+    // ---- Py-agent delegation ----
+    // POST to the Python LangGraph sidecar. Py owns conversation state via its
+    // Mongo checkpointer; Node keeps STT (via Realtime API), TTS, barge-in, and
+    // transcript persistence. On Py failure we surface response.error to the WS.
     async function runPyAgentTurn(userText) {
       const isOpen = userText === null || userText === undefined;
       const endpoint = isOpen ? '/open' : '/turn';
@@ -361,149 +212,31 @@ export function attachRealtimeProxy(httpServer) {
       await synthesizeAndStream(assistantText);
     }
 
-    // ---- LLM + tool loop ----
+    // ---- Assistant turn ----
+    // Defers entirely to the Py sidecar. On failure we surface response.error
+    // to the WS — no silent fallback.
     async function runAssistantTurn(userText = null) {
       if (turnRunning) {
         console.log(`[rt ${cid}] turn already running — queuing`);
         turnQueued = true;
-        // Remember the most recent queued utterance for Py path replay;
-        // the Node path reads from conversationHistory so it doesn't care.
         queuedUserText = userText;
         return;
       }
       turnRunning = true;
       turnQueued = false;
 
-      // Py-agent path: defer entirely to the sidecar. Skip the local LLM
-      // loop, tool dispatch, and conversationHistory bookkeeping.
-      if (config.pyAgent.useEnvAgent) {
-        try {
-          await runPyAgentTurn(userText);
-        } catch (err) {
-          console.error(`[rt ${cid}] [py-agent] ERROR:`, err.message);
-          send(client, { type: 'response.error', error: { message: err.message } });
-        } finally {
-          turnRunning = false;
-          if (turnQueued && !closed) {
-            const next = queuedUserText;
-            queuedUserText = null;
-            console.log(`[rt ${cid}] draining queued turn (py-agent)`);
-            runAssistantTurn(next);
-          }
-        }
-        return;
-      }
-
-      // Bumped from 8 — chained non-question items consume extra iterations.
-      const MAX_TOOL_ITERATIONS = 20;
-      // Track last item type from tool results so we can auto-continue
-      // after non-question items (they don't wait for user input).
-      let lastItemType = null;
-      let lastItemRequirement = null;
-      // When true, the next LLM call forces tool invocation.
-      let forceToolCall = false;
-
       try {
-        for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-          if (closed) return;
-          console.log(`[rt ${cid}] LLM call #${i + 1} messages=${conversationHistory.length} forceToolCall=${forceToolCall}`);
-
-          const toolChoice = forceToolCall
-            ? { type: 'function', function: { name: 'get_next_interview_question' } }
-            : 'auto';
-          forceToolCall = false;
-
-          const json = await chatCompletion(conversationHistory, tools, toolChoice);
-          const choice = json.choices?.[0];
-          if (!choice) {
-            console.error(`[rt ${cid}] LLM returned no choices`);
-            return;
-          }
-
-          const msg = choice.message;
-
-          // Tool calls?
-          if (msg.tool_calls && msg.tool_calls.length > 0) {
-            // The LLM sometimes returns content alongside tool_calls
-            // (e.g. speaking a non-question item while calling the tool
-            // for the next one). Speak that content before processing
-            // the tool calls so it isn't silently dropped.
-            if (msg.content && msg.content.trim()) {
-              const inlineText = msg.content;
-              console.log(`[rt ${cid}] LLM inline content+tool_calls: "${inlineText.slice(0, 120)}"`);
-              await persistTurn('assistant', inlineText);
-              await synthesizeAndStream(inlineText);
-            }
-
-            // Append the assistant message (with tool_calls) to history.
-            conversationHistory.push(msg);
-
-            for (const tc of msg.tool_calls) {
-              let args = {};
-              try { args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {}; } catch (err) {
-                console.warn(`[rt ${cid}] could not parse tool args:`, err.message);
-              }
-              console.log(`[rt ${cid}] TOOL CALL name=${tc.function.name} id=${tc.id} args=${JSON.stringify(args)}`);
-
-              const toolStart = Date.now();
-              const result = await handleToolCall({
-                name: tc.function.name,
-                args,
-                interviewId,
-                questionSet,
-              });
-              const toolElapsed = Date.now() - toolStart;
-              console.log(`[rt ${cid}] [timing] tool ${tc.function.name}: ${toolElapsed}ms`);
-              console.log(`[rt ${cid}] TOOL RESULT → ${JSON.stringify(result)}`);
-
-              // Track the item type/requirement so we know what to do after TTS.
-              if (result.type) lastItemType = result.type;
-              if (result.hasOwnProperty('requirement')) lastItemRequirement = result.requirement || '';
-
-              conversationHistory.push({
-                role: 'tool',
-                tool_call_id: tc.id,
-                content: JSON.stringify(result),
-              });
-            }
-            // Loop — re-POST to LLM with the tool results.
-            continue;
-          }
-
-          // Final text response.
-          const text = msg.content ?? '';
-          console.log(`[rt ${cid}] LLM response (lastItemType=${lastItemType}): "${text.slice(0, 120)}"`);
-          conversationHistory.push({ role: 'assistant', content: text });
-          await persistTurn('assistant', text);
-
-          // TTS + synchronized transcript (words drip with audio).
-          await synthesizeAndStream(text);
-
-          // Non-question items (intro, transition, closing) don't wait for
-          // user input. Auto-continue so the LLM calls the tool again for
-          // the next item.
-          if (lastItemType === 'non-question') {
-            console.log(`[rt ${cid}] non-question delivered — auto-continuing`);
-            lastItemType = null;
-            continue;
-          }
-
-          // For question items (qualitative/factual), always wait for the
-          // user to respond — even if requirement is empty (e.g. a greeting).
-          // Only force-continue for non-questions with empty requirement.
-          console.log(`[rt ${cid}] question delivered (type=${lastItemType}) — waiting for user`);
-          
-          return;
-        }
-        console.warn(`[rt ${cid}] tool loop hit max iterations (${MAX_TOOL_ITERATIONS})`);
+        await runPyAgentTurn(userText);
       } catch (err) {
-        console.error(`[rt ${cid}] runAssistantTurn error:`, err);
-        send(client, { type: 'error', error: { message: err.message } });
+        console.error(`[rt ${cid}] [py-agent] ERROR:`, err.message);
+        send(client, { type: 'response.error', error: { message: err.message } });
       } finally {
         turnRunning = false;
         if (turnQueued && !closed) {
+          const next = queuedUserText;
+          queuedUserText = null;
           console.log(`[rt ${cid}] draining queued turn`);
-          runAssistantTurn();
+          runAssistantTurn(next);
         }
       }
     }
@@ -618,13 +351,7 @@ export function attachRealtimeProxy(httpServer) {
         if (browserInCount === 1 || browserInCount % 25 === 0) {
           console.log(`[rt ${cid}] ← browser #${browserInCount} input_audio_buffer.append audio(${Math.round((parsed.audio.length || 0) * 0.75)}B)`);
         }
-        // Decode base64 PCM16 and push to STT stream.
-        try {
-          const int16 = b64ToInt16(parsed.audio);
-          stt.pushStream.write(int16.buffer);
-        } catch (err) {
-          console.error(`[rt ${cid}] audio decode error:`, err.message);
-        }
+        sttClient.pushAudio(parsed.audio);
       } else {
         console.log(`[rt ${cid}] ← browser #${browserInCount} ${parsed?.type ?? 'unknown'}`);
       }
@@ -639,13 +366,7 @@ export function attachRealtimeProxy(httpServer) {
     client.on('close', (code, reason) => {
       closed = true;
       console.log(`[rt ${cid}] client CLOSE code=${code} reason="${reason?.toString() ?? ''}" — totals: browserIn=${browserInCount} audioOut=${audioOutCount}`);
-      // Cancel pending debounce.
-      if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
-      // Stop STT.
-      try { stt.recognizer.close(); } catch (_) {}
-      try { stt.pushStream.close(); } catch (_) {}
-      console.log(`[rt ${cid}] STT closed`);
-      // Abort any in-flight TTS.
+      sttClient.close();
       if (currentTts) currentTts.abort = true;
     });
   });
