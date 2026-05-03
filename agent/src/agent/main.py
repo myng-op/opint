@@ -1,3 +1,5 @@
+import time
+
 from bson import ObjectId
 from fastapi import Depends, FastAPI, HTTPException
 from langchain_core.language_models import BaseChatModel
@@ -34,7 +36,11 @@ def get_next_interview_question(config: RunnableConfig) -> dict:
     Returns {key, content, type, requirement, max_sec, question_number,
     total_questions} or {done: true} when the interview is complete."""
     cfg = config["configurable"]
-    return _gnq_impl(cfg["agent_db"], cfg["agent_interview_id"], cfg["agent_question_set"])
+    t0 = time.perf_counter()
+    result = _gnq_impl(cfg["agent_db"], cfg["agent_interview_id"], cfg["agent_question_set"])
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"[agent] [timing] tool get_next_interview_question: {elapsed_ms:.0f}ms")
+    return result
 
 
 def build_app_graph(llm: BaseChatModel, checkpointer: BaseCheckpointSaver):
@@ -127,7 +133,11 @@ def turn(
 
 def _safe_invoke(graph, input_state: dict, config: dict) -> dict:
     try:
-        return graph.invoke(input_state, config=config)
+        t0 = time.perf_counter()
+        result = graph.invoke(input_state, config=config)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[agent] [timing] graph.invoke: {elapsed_ms:.0f}ms")
+        return result
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"agent error: {exc}") from exc
 

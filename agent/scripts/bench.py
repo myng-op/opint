@@ -7,9 +7,15 @@ verify the ≤1.5× budget.
 
 Usage:
     BENCH_LIVE=1 INTERVIEW_ID=<oid> uv run python scripts/bench.py
+    BENCH_LIVE=1 INTERVIEW_ID=<oid> uv run python scripts/bench.py --trace
+
+The --trace flag runs N=1 turn and prints a reminder to check server logs
+for per-stage [timing] breakdown (STT, tool, TTS on Node; graph.invoke,
+tool on Py).
 """
 from __future__ import annotations
 
+import argparse
 import os
 import statistics
 import sys
@@ -19,6 +25,14 @@ import httpx
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Latency benchmark for Py agent")
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Run 1 turn and remind to check server logs for [timing] breakdown",
+    )
+    args = parser.parse_args()
+
     if os.environ.get("BENCH_LIVE") != "1":
         print("Set BENCH_LIVE=1 to run (uses real Azure quota).")
         return 0
@@ -29,7 +43,7 @@ def main() -> int:
         return 1
 
     base = os.environ.get("PY_AGENT_URL", "http://localhost:8001")
-    n = int(os.environ.get("BENCH_N", "10"))
+    n = 1 if args.trace else int(os.environ.get("BENCH_N", "10"))
     canned = ["Yes.", "Maybe.", "I think so.", "Hmm.", "Tell me more."]
 
     print(f"Opening {interview_id}...")
@@ -50,10 +64,17 @@ def main() -> int:
 
     timings.sort()
     p50 = statistics.median(timings)
-    p95 = timings[int(0.95 * (len(timings) - 1))]
+    p95 = timings[int(0.95 * (len(timings) - 1))] if len(timings) > 1 else timings[0]
     print()
     print(f"N={n} turns | p50={p50:.0f}ms | p95={p95:.0f}ms | "
           f"min={timings[0]:.0f}ms | max={timings[-1]:.0f}ms")
+
+    if args.trace:
+        print()
+        print("=== Trace mode ===")
+        print("Check server logs for per-stage [timing] lines:")
+        print("  Node: grep '[timing]' in npm run dev output")
+        print("  Py:   docker compose logs agent | grep '[timing]'")
     return 0
 
 

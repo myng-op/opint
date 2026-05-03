@@ -218,6 +218,7 @@ export function attachRealtimeProxy(httpServer) {
     const RECOGNIZE_DEBOUNCE_MS = 1500; // wait 1.5s of silence after last fragment
     let pendingUtterance = '';
     let debounceTimer = null;
+    let sttFirstFragmentTime = null; // Phase 12 timing: track first fragment arrival
 
     // ---- STT setup ----
     let stt = createRecognizer(cid, { language: connLanguage });
@@ -254,6 +255,7 @@ export function attachRealtimeProxy(httpServer) {
         }
 
         // Accumulate fragment.
+        if (!pendingUtterance) sttFirstFragmentTime = Date.now(); // Phase 12 timing
         pendingUtterance += (pendingUtterance ? ' ' : '') + text;
 
         // Reset debounce timer.
@@ -264,7 +266,10 @@ export function attachRealtimeProxy(httpServer) {
 
           const fullText = pendingUtterance;
           pendingUtterance = '';
+          const sttElapsed = sttFirstFragmentTime ? Date.now() - sttFirstFragmentTime : 0;
+          sttFirstFragmentTime = null;
 
+          console.log(`[rt ${cid}] [timing] STT first-fragment→flush: ${sttElapsed}ms`);
           console.log(`[rt ${cid}] STT final (debounced): "${fullText.slice(0, 120)}"`);
 
           send(client, {
@@ -440,12 +445,15 @@ export function attachRealtimeProxy(httpServer) {
               }
               console.log(`[rt ${cid}] TOOL CALL name=${tc.function.name} id=${tc.id} args=${JSON.stringify(args)}`);
 
+              const toolStart = Date.now();
               const result = await handleToolCall({
                 name: tc.function.name,
                 args,
                 interviewId,
                 questionSet,
               });
+              const toolElapsed = Date.now() - toolStart;
+              console.log(`[rt ${cid}] [timing] tool ${tc.function.name}: ${toolElapsed}ms`);
               console.log(`[rt ${cid}] TOOL RESULT → ${JSON.stringify(result)}`);
 
               // Track the item type/requirement so we know what to do after TTS.
@@ -504,6 +512,7 @@ export function attachRealtimeProxy(httpServer) {
     async function synthesizeAndStream(text) {
       if (closed || !text.trim()) return;
 
+      const ttsEnterTime = Date.now(); // Phase 12 timing
       const ttsJob = { abort: false };
       currentTts = ttsJob;
 
@@ -516,6 +525,7 @@ export function attachRealtimeProxy(httpServer) {
         synthesizer.speakTextAsync(
           cleanText,
           (result) => {
+            const ttsAzureElapsed = Date.now() - ttsEnterTime; // Phase 12 timing
             if (ttsJob.abort) {
               console.log(`[rt ${cid}] TTS aborted (barge-in)`);
               synthesizer.close();
@@ -523,6 +533,7 @@ export function attachRealtimeProxy(httpServer) {
               return;
             }
             if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
+              console.log(`[rt ${cid}] [timing] TTS Azure ready: ${ttsAzureElapsed}ms`);
               const audioData = result.audioData;
               const totalChunks = Math.ceil(audioData.byteLength / CHUNK_BYTES);
 
@@ -574,6 +585,8 @@ export function attachRealtimeProxy(httpServer) {
                 send(client, { type: 'response.audio_transcript.done', transcript: text });
                 send(client, { type: 'response.done' });
               }
+              const ttsTotalElapsed = Date.now() - ttsEnterTime; // Phase 12 timing
+              console.log(`[rt ${cid}] [timing] TTS total: ${ttsTotalElapsed}ms`);
               console.log(`[rt ${cid}] TTS complete text="${text.slice(0, 60)}…" chunks=${audioOutCount}`);
             } else {
               console.error(`[rt ${cid}] TTS failed reason=${result.reason} errorDetails=${result.errorDetails}`);
